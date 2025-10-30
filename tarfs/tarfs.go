@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -281,7 +282,24 @@ func resolve(root *dirent, name string) (*dirent, error) {
 }
 
 func sanitizePath(name string) string {
-	return strings.TrimPrefix(strings.TrimPrefix(filepath.Clean(filepath.ToSlash(strings.TrimSpace(name))), "."), "/")
+	name = strings.TrimSpace(name)
+	name = filepath.ToSlash(name)
+	name = strings.ReplaceAll(name, "//", "/")
+
+	cleaned := path.Clean(name)
+	switch cleaned {
+	case ".", "/", "":
+		return ""
+	}
+
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	cleaned = strings.TrimPrefix(cleaned, "./")
+
+	if strings.HasPrefix(cleaned, "..") {
+		return ""
+	}
+
+	return cleaned
 }
 
 type file struct {
