@@ -597,6 +597,15 @@ func (ino *Inode) Mode() fs.FileMode {
 	if ino.IsSymlink() {
 		mode |= fs.ModeSymlink
 	}
+	if ino.mode&S_ISUID != 0 {
+		mode |= fs.ModeSetuid
+	}
+	if ino.mode&S_ISGID != 0 {
+		mode |= fs.ModeSetgid
+	}
+	if ino.mode&S_ISVTX != 0 {
+		mode |= fs.ModeSticky
+	}
 
 	return mode
 }
