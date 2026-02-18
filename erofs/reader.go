@@ -583,7 +583,7 @@ func (ino *Inode) Mode() fs.FileMode {
 		mode |= fs.ModeDir
 	}
 	if ino.IsCharDev() {
-		mode |= fs.ModeCharDevice
+		mode |= fs.ModeDevice | fs.ModeCharDevice
 	}
 	if ino.IsBlockDev() {
 		mode |= fs.ModeDevice
