@@ -104,11 +104,16 @@ func (rootFS *FS) MkdirAll(path string, perm os.FileMode) error {
 		} else {
 			childDir, ok := child.(*dir)
 			if !ok {
+				cur.mu.Unlock()
 				return fmt.Errorf("not a directory: %s: %w", part, fs.ErrInvalid)
 			}
 			next = childDir
 		}
+		// Lock the child before unlocking the parent to prevent
+		// concurrent MkdirAll calls from racing on the same path.
+		next.mu.Lock()
 		cur.mu.Unlock()
+		next.mu.Unlock()
 	}
 
 	return nil
