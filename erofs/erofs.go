@@ -159,7 +159,15 @@ func (fsys *Filesystem) StatLink(name string) (fs.FileInfo, error) {
 	return fsys.Lstat(name)
 }
 
+// maxSymlinks is the maximum number of symlink resolutions allowed during
+// a single path resolution, matching the Linux kernel limit (MAXSYMLINKS).
+const maxSymlinks = 40
+
 func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEntry, error) {
+	return fsys.resolveDepth(name, noResolveLastSymlink, maxSymlinks)
+}
+
+func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, remaining int) (*dirEntry, error) {
 	de := fsys.root
 
 	components := splitPath(name)
@@ -172,6 +180,10 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 		ino := child.getInode()
 
 		if ino.IsSymlink() && !(noResolveLastSymlink && i == len(components)-1) {
+			if remaining <= 0 {
+				return nil, errors.New("too many levels of symbolic links")
+			}
+
 			link, err := ino.Readlink()
 			if err != nil {
 				return nil, err
@@ -184,7 +196,7 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 				link = filepath.Join(strings.Join(components[:i], "/"), link)
 			}
 
-			child, err = fsys.resolve(link, noResolveLastSymlink)
+			child, err = fsys.resolveDepth(link, noResolveLastSymlink, remaining-1)
 			if err != nil {
 				return nil, err
 			}

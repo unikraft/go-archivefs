@@ -10,6 +10,7 @@
 package erofs_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/unikraft/go-archivefs/erofs"
 	"github.com/unikraft/go-archivefs/memfs"
+	"github.com/unikraft/go-archivefs/tarfs"
 	"github.com/rogpeppe/go-internal/dirhash"
 
 	"github.com/stretchr/testify/require"
@@ -332,6 +334,46 @@ func TestEROFSFilenamesSortingBeforeDotRoot(t *testing.T) {
 	info, err := fsys.Stat("zebra.txt")
 	require.NoError(t, err)
 	require.Equal(t, "zebra.txt", info.Name())
+}
+
+func TestEROFSSymlinkCycleDetection(t *testing.T) {
+	// Create a tar archive with circular symlinks: a -> b, b -> a.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "a",
+		Typeflag: tar.TypeSymlink,
+		Linkname: "b",
+	}))
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "b",
+		Typeflag: tar.TypeSymlink,
+		Linkname: "a",
+	}))
+	require.NoError(t, tw.Close())
+
+	// Open as tarfs (which implements ReadLinkFS).
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
+
+	// Create an EROFS image containing the cycle.
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "cycle.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	// Resolving "a" follows a -> b -> a -> b -> ... and must return an
+	// error rather than overflowing the stack.
+	_, err = fsys.Stat("a")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "too many levels of symbolic links")
+
+	_, err = fsys.Open("b")
+	require.Error(t, err)
 }
 
 func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
