@@ -98,6 +98,7 @@ func (w *writer) write() error {
 
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
+		FeatureCompat: FeatureCompatSuperBlockChecksum,
 		BlockSizeBits: BlockSizeBits,
 		Inodes:        uint64(len(w.inodes)),
 		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),

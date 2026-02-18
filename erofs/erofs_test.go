@@ -376,6 +376,36 @@ func TestEROFSSymlinkCycleDetection(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestEROFSSuperBlockChecksum(t *testing.T) {
+	// Create a valid image.
+	srcFS := memfs.New()
+	require.NoError(t, srcFS.WriteFile("hello.txt", []byte("hello"), 0o644))
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "checksum.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	// Valid image should open without error.
+	_, err = erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	// Corrupt a byte in the superblock (the Inodes field at offset 1024+16).
+	stat, err := imgFile.Stat()
+	require.NoError(t, err)
+	data := make([]byte, stat.Size())
+	_, err = imgFile.ReadAt(data, 0)
+	require.NoError(t, err)
+
+	data[1024+16] ^= 0xFF // flip a byte in the superblock body
+
+	// Opening the corrupted image should fail checksum verification.
+	_, err = erofs.Open(bytes.NewReader(data))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid checksum")
+}
+
 func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 	// Create a valid image with a file.
 	srcFS := memfs.New()
