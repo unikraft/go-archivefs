@@ -57,6 +57,7 @@ type writer struct {
 	dst        io.WriterAt
 	inodes     map[string]any
 	inodeOrder []string
+	fileSizes  map[string]int64
 	linkMap    map[uint64]inodeCount
 	opts       ErofsCreateOptions
 }
@@ -150,11 +151,30 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
-		data, size, err := w.dataForInode(path, ino)
-		if err != nil {
-			return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
+		// For regular files, use the cached size from populateInodes to avoid
+		// opening the file twice (once here for size, once in the write phase
+		// for data). Directories and symlinks must still call dataForInode
+		// because their encoded size differs from fi.Size().
+		var size int64
+		var mode uint16
+		switch ino := ino.(type) {
+		case InodeCompact:
+			mode = ino.Mode
+		case InodeExtended:
+			mode = ino.Mode
 		}
-		_ = data.Close()
+		if mode&S_IFMT == S_IFREG {
+			size = w.fileSizes[path]
+		} else {
+			data, sz, err := w.dataForInode(path, ino)
+			if err != nil {
+				return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
+			}
+			if err := data.Close(); err != nil {
+				return metaSize, dataSize, fmt.Errorf("failed to close data for %q: %w", path, err)
+			}
+			size = sz
+		}
 
 		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
 		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
@@ -434,6 +454,7 @@ func (w *writer) writeData() error {
 
 func (w *writer) populateInodes() error {
 	w.inodes = map[string]any{}
+	w.fileSizes = map[string]int64{}
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -483,6 +504,7 @@ func (w *writer) populateInodes() error {
 
 		w.inodes[path] = toInode(fi, nlink, w.opts.allRoot, originalFInfo)
 		w.inodeOrder = append(w.inodeOrder, path)
+		w.fileSizes[path] = fi.Size()
 
 		return nil
 	})
