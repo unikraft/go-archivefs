@@ -94,6 +94,9 @@ func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	var dirents []fs.DirEntry
 	err = ino.IterDirents(func(name string, typ uint8, nid uint64) error {
@@ -129,6 +132,9 @@ func (fsys *Filesystem) Stat(name string) (fs.FileInfo, error) {
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -150,6 +156,9 @@ func (fsys *Filesystem) ReadLink(name string) (string, error) {
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return "", de.inodeErr
+	}
 
 	return ino.Readlink()
 }
@@ -165,6 +174,9 @@ func (fsys *Filesystem) Lstat(name string) (fs.FileInfo, error) {
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -198,6 +210,9 @@ func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, rem
 		}
 
 		ino := child.getInode()
+		if child.inodeErr != nil {
+			return nil, child.inodeErr
+		}
 
 		if ino.IsSymlink() && !(noResolveLastSymlink && i == len(components)-1) {
 			if remaining <= 0 {
@@ -234,10 +249,12 @@ type file struct {
 
 func (f *file) Read(p []byte) (int, error) {
 	if f.r == nil {
-		var err error
-
 		ino := f.de.getInode()
+		if f.de.inodeErr != nil {
+			return 0, f.de.inodeErr
+		}
 
+		var err error
 		f.r, err = ino.Data()
 		if err != nil {
 			return 0, err
@@ -294,6 +311,9 @@ func (de *dirEntry) Type() fs.FileMode {
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -304,6 +324,9 @@ func (de *dirEntry) Info() (fs.FileInfo, error) {
 
 func (de *dirEntry) lookup(name string) (*dirEntry, error) {
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	d, err := ino.Lookup(name)
 	if err != nil {
