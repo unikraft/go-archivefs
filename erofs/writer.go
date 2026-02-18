@@ -511,7 +511,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		names = append(names, "..")
 
 		for _, de := range entries {
-			path := filepath.Clean(filepath.Join(path, de.Name()))
+			path := filepath.Join(path, de.Name())
 			nid, err := w.findInodeAtPath(path)
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
