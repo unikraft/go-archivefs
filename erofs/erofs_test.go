@@ -99,23 +99,23 @@ func TestEROFS(t *testing.T) {
 
 		require.Equal(t, "group", entries[0].Name())
 		require.False(t, entries[0].IsDir())
-		require.Equal(t, 0o644, int(entries[0].Type()))
+		require.Equal(t, fs.FileMode(0), entries[0].Type())
 
 		require.Equal(t, "os-release", entries[1].Name())
 		require.False(t, entries[1].IsDir())
-		require.Equal(t, 0o644, int(entries[1].Type()))
+		require.Equal(t, fs.FileMode(0), entries[1].Type())
 
 		require.Equal(t, "passwd", entries[2].Name())
 		require.False(t, entries[2].IsDir())
-		require.Equal(t, 0o644, int(entries[2].Type()))
+		require.Equal(t, fs.FileMode(0), entries[2].Type())
 
 		require.Equal(t, "rc", entries[3].Name())
 		require.True(t, entries[3].IsDir())
-		require.True(t, entries[3].Type()&fs.ModeDir > 0)
+		require.Equal(t, fs.ModeDir, entries[3].Type())
 
 		require.Equal(t, "resolv.conf", entries[4].Name())
 		require.False(t, entries[4].IsDir())
-		require.Equal(t, 0o644, int(entries[4].Type()))
+		require.Equal(t, fs.FileMode(0), entries[4].Type())
 	})
 
 	t.Run("Stat", func(t *testing.T) {
@@ -654,6 +654,62 @@ func TestEROFSFileOpenedOnce(t *testing.T) {
 	data, err = fs.ReadFile(fsys, "big.txt")
 	require.NoError(t, err)
 	require.Len(t, data, 8192)
+}
+
+func TestEROFSDirEntryTypeReturnsBits(t *testing.T) {
+	// Build a tar archive with a directory, regular file, and symlink.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     "subdir/",
+		Mode:     0o755,
+	}))
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "subdir/file.txt",
+		Size:     5,
+		Mode:     0o644,
+	}))
+	_, err := tw.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeSymlink,
+		Name:     "link",
+		Linkname: "subdir/file.txt",
+		Mode:     0o777,
+	}))
+	require.NoError(t, tw.Close())
+
+	tfs, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
+
+	imgFile, err := os.CreateTemp(t.TempDir(), "type-test-*.img")
+	require.NoError(t, err)
+	t.Cleanup(func() { imgFile.Close() })
+
+	require.NoError(t, erofs.Create(imgFile, tfs))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	entries, err := fs.ReadDir(fsys, ".")
+	require.NoError(t, err)
+
+	typeMap := make(map[string]fs.FileMode)
+	for _, e := range entries {
+		typeMap[e.Name()] = e.Type()
+	}
+
+	// Type() must return only the type bits, not permission bits.
+	require.Equal(t, fs.ModeDir, typeMap["subdir"], "directory should have ModeDir type")
+	require.Equal(t, fs.ModeSymlink, typeMap["link"], "symlink should have ModeSymlink type")
+
+	subEntries, err := fs.ReadDir(fsys, "subdir")
+	require.NoError(t, err)
+	require.Len(t, subEntries, 1)
+	// Regular file: Type() should be exactly 0 (no type bits set).
+	require.Equal(t, fs.FileMode(0), subEntries[0].Type(), "regular file should have zero type bits")
 }
 
 func TestEROFSCreate(t *testing.T) {

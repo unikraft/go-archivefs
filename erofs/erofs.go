@@ -257,7 +257,7 @@ func (de *dirEntry) IsDir() bool {
 func (de *dirEntry) Type() fs.FileMode {
 	ino := de.getInode()
 
-	return ino.Mode()
+	return ino.Mode().Type()
 }
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
