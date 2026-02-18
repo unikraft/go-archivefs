@@ -109,6 +109,35 @@ func TestMemFS(t *testing.T) {
 	require.Equal(t, body, gotBody)
 }
 
+func TestMemFSRootStatName(t *testing.T) {
+	rootFS := memfs.New()
+
+	// Open "." and verify Stat returns name ".".
+	f, err := rootFS.Open(".")
+	require.NoError(t, err)
+
+	fi, err := f.Stat()
+	require.NoError(t, err)
+	require.Equal(t, ".", fi.Name())
+	require.True(t, fi.IsDir())
+	require.NoError(t, f.Close())
+
+	// Sub-FS root should also return "." for Stat name.
+	require.NoError(t, rootFS.MkdirAll("subdir", 0o755))
+
+	subFS, err := rootFS.Sub("subdir")
+	require.NoError(t, err)
+
+	sf, err := subFS.Open(".")
+	require.NoError(t, err)
+
+	sfi, err := sf.Stat()
+	require.NoError(t, err)
+	require.Equal(t, ".", sfi.Name(), "Sub-FS root Stat().Name() should be \".\"")
+	require.True(t, sfi.IsDir())
+	require.NoError(t, sf.Close())
+}
+
 func TestMemFSReadDirSorted(t *testing.T) {
 	rootFS := memfs.New()
 
