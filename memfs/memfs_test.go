@@ -42,6 +42,7 @@ package memfs_test
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"slices"
 	"testing"
@@ -162,6 +163,11 @@ func TestMemFSReadDirPagination(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batch3, 1)
 	require.Equal(t, "e.txt", batch3[0].Name())
+
+	// Reading past end with n>0 must return io.EOF per fs.ReadDirFile contract.
+	batch4, err := dirFile.ReadDir(2)
+	require.ErrorIs(t, err, io.EOF)
+	require.Nil(t, batch4)
 
 	require.NoError(t, f.Close())
 }
