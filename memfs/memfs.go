@@ -470,7 +470,7 @@ func (de *dirEntry) IsDir() bool {
 }
 
 func (de *dirEntry) Type() fs.FileMode {
-	return de.info.Mode()
+	return de.info.Mode().Type()
 }
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {

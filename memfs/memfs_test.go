@@ -138,6 +138,25 @@ func TestMemFSRootStatName(t *testing.T) {
 	require.NoError(t, sf.Close())
 }
 
+func TestMemFSDirEntryType(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.MkdirAll("subdir", 0o755))
+	require.NoError(t, rootFS.WriteFile("file.txt", []byte("hi"), 0o644))
+
+	entries, err := fs.ReadDir(rootFS, ".")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	typeMap := make(map[string]fs.FileMode)
+	for _, e := range entries {
+		typeMap[e.Name()] = e.Type()
+	}
+
+	// Type() must return only type bits, not permission bits.
+	require.Equal(t, fs.FileMode(0), typeMap["file.txt"], "regular file Type() should be 0")
+	require.Equal(t, fs.ModeDir, typeMap["subdir"], "directory Type() should be exactly ModeDir")
+}
+
 func TestMemFSReadDirSorted(t *testing.T) {
 	rootFS := memfs.New()
 
