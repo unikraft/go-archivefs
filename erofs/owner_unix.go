@@ -19,18 +19,13 @@ import (
 )
 
 func getOwner(fi fs.FileInfo) (uid, gid int) {
-	switch fi.Sys().(type) {
+	switch sys := fi.Sys().(type) {
 	case *syscall.Stat_t:
-		stat := fi.Sys().(*syscall.Stat_t)
-
-		uid = int(stat.Uid)
-		gid = int(stat.Gid)
-
+		uid = int(sys.Uid)
+		gid = int(sys.Gid)
 	case *tar.Header:
-		hdr := fi.Sys().(*tar.Header)
-
-		uid = hdr.Uid
-		gid = hdr.Gid
+		uid = sys.Uid
+		gid = sys.Gid
 	}
 
 	return
