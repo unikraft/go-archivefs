@@ -258,7 +258,15 @@ func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
 	return d.Info()
 }
 
+// maxSymlinks is the maximum number of symlink resolutions allowed during
+// a single path resolution, matching the Linux kernel limit (MAXSYMLINKS).
+const maxSymlinks = 40
+
 func resolve(root *dirent, name string) (*dirent, error) {
+	return resolveDepth(root, name, maxSymlinks)
+}
+
+func resolveDepth(root *dirent, name string, remaining int) (*dirent, error) {
 	d := root
 
 	name = sanitizePath(name)
@@ -274,18 +282,22 @@ func resolve(root *dirent, name string) (*dirent, error) {
 		}
 
 		if d.Type()&fs.ModeSymlink != 0 {
+			if remaining <= 0 {
+				return nil, errors.New("too many levels of symbolic links")
+			}
+
 			// Resolve the symlink.
 			target := d.Linkname
 
 			var err error
 			if !filepath.IsAbs(target) && d.parent != nil {
-				d, err = resolve(d.parent, target)
+				d, err = resolveDepth(d.parent, target, remaining-1)
 				if err != nil {
 					return nil, err
 				}
 			} else {
 				// The target is an absolute path or the dirent is the root dirent.
-				d, err = resolve(root, target)
+				d, err = resolveDepth(root, target, remaining-1)
 				if err != nil {
 					return nil, err
 				}
