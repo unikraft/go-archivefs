@@ -95,7 +95,10 @@ func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: errors.New("not a directory")}
 	}
 
-	ino := de.getInode()
+	ino, err := de.getInode()
+	if err != nil {
+		return nil, err
+	}
 
 	var dirents []fs.DirEntry
 	err = ino.IterDirents(func(name string, typ uint8, nid uint64) error {
@@ -130,7 +133,10 @@ func (fsys *Filesystem) Stat(name string) (fs.FileInfo, error) {
 		return nil, err
 	}
 
-	ino := de.getInode()
+	ino, err := de.getInode()
+	if err != nil {
+		return nil, err
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -151,7 +157,10 @@ func (fsys *Filesystem) ReadLink(name string) (string, error) {
 		return "", err
 	}
 
-	ino := de.getInode()
+	ino, err := de.getInode()
+	if err != nil {
+		return "", err
+	}
 
 	return ino.Readlink()
 }
@@ -166,7 +175,10 @@ func (fsys *Filesystem) Lstat(name string) (fs.FileInfo, error) {
 		return nil, err
 	}
 
-	ino := de.getInode()
+	ino, err := de.getInode()
+	if err != nil {
+		return nil, err
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -199,7 +211,10 @@ func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, rem
 			return nil, err
 		}
 
-		ino := child.getInode()
+		ino, err := child.getInode()
+		if err != nil {
+			return nil, err
+		}
 
 		if ino.IsSymlink() && !(noResolveLastSymlink && i == len(components)-1) {
 			if remaining <= 0 {
@@ -236,9 +251,10 @@ type file struct {
 
 func (f *file) Read(p []byte) (int, error) {
 	if f.r == nil {
-		var err error
-
-		ino := f.de.getInode()
+		ino, err := f.de.getInode()
+		if err != nil {
+			return 0, err
+		}
 
 		f.r, err = ino.Data()
 		if err != nil {
@@ -275,6 +291,8 @@ func (de *dirEntry) IsDir() bool {
 	return de.typ == FT_DIR
 }
 
+// Type returns the file mode type bits from the directory entry's cached type
+// field (de.typ), avoiding a potentially expensive inode load.
 func (de *dirEntry) Type() fs.FileMode {
 	switch de.typ {
 	case FT_DIR:
@@ -295,7 +313,10 @@ func (de *dirEntry) Type() fs.FileMode {
 }
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
-	ino := de.getInode()
+	ino, err := de.getInode()
+	if err != nil {
+		return nil, err
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -305,7 +326,10 @@ func (de *dirEntry) Info() (fs.FileInfo, error) {
 }
 
 func (de *dirEntry) lookup(name string) (*dirEntry, error) {
-	ino := de.getInode()
+	ino, err := de.getInode()
+	if err != nil {
+		return nil, err
+	}
 
 	d, err := ino.Lookup(name)
 	if err != nil {
@@ -320,7 +344,7 @@ func (de *dirEntry) lookup(name string) (*dirEntry, error) {
 	}, nil
 }
 
-func (de *dirEntry) getInode() Inode {
+func (de *dirEntry) getInode() (Inode, error) {
 	de.readInodeOnce.Do(func() {
 		ino, err := de.image.Inode(de.nid)
 		if err != nil {
@@ -331,9 +355,9 @@ func (de *dirEntry) getInode() Inode {
 	})
 
 	if de.inode == nil {
-		return Inode{}
+		return Inode{}, de.inodeErr
 	}
-	return *de.inode
+	return *de.inode, nil
 }
 
 type fileInfo struct {
