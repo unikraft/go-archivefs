@@ -219,3 +219,29 @@ func TestMemFSReadDirPagination(t *testing.T) {
 
 	require.NoError(t, f.Close())
 }
+
+func TestMemFSStatSizeAfterRead(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.WriteFile("file.txt", []byte("hello world"), 0o644))
+
+	f, err := rootFS.Open("file.txt")
+	require.NoError(t, err)
+
+	// Stat before any reads should report the full size.
+	fi, err := f.Stat()
+	require.NoError(t, err)
+	require.Equal(t, int64(11), fi.Size())
+
+	// Partial read.
+	buf := make([]byte, 5)
+	n, err := f.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, 5, n)
+
+	// Stat after partial read must still report the full file size.
+	fi, err = f.Stat()
+	require.NoError(t, err)
+	require.Equal(t, int64(11), fi.Size(), "Size() should not decrease after Read()")
+
+	require.NoError(t, f.Close())
+}
