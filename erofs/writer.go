@@ -18,7 +18,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,6 +54,7 @@ type writer struct {
 	dst        io.WriterAt
 	inodes     map[string]any
 	inodeOrder []string
+	fileSizes  map[string]int64
 	linkMap    map[uint64]inodeCount
 	opts       ErofsCreateOptions
 }
@@ -87,6 +87,20 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write data blocks: %w", err)
 	}
 
+	rootIno, ok := w.inodes["."]
+	if !ok {
+		return fmt.Errorf("root inode not found")
+	}
+	var rootNid uint16
+	switch ino := rootIno.(type) {
+	case InodeCompact:
+		rootNid = uint16(ino.Ino)
+	case InodeExtended:
+		rootNid = uint16(ino.Ino)
+	default:
+		return fmt.Errorf("unsupported root inode type %T", rootIno)
+	}
+
 	// Generate a UUID for the filesystem.
 	uuidBytes, err := uuid.New().MarshalBinary()
 	if err != nil {
@@ -100,6 +114,7 @@ func (w *writer) write() error {
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
 		BlockSizeBits: BlockSizeBits,
+		RootNid:       rootNid,
 		Inodes:        uint64(len(w.inodes)),
 		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
@@ -132,11 +147,21 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
-		data, size, err := w.dataForInode(path, ino)
-		if err != nil {
-			return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
+		// For regular files, use the cached size from populateInodes to avoid
+		// opening the file twice (once here for size, once in the write phase
+		// for data). Directories and symlinks must still call dataForInode
+		// because their encoded size differs from fi.Size().
+		var size int64
+		if inodeMode(ino)&S_IFMT == S_IFREG {
+			size = w.fileSizes[path]
+		} else {
+			data, sz, err := w.dataForInode(path, ino)
+			if err != nil {
+				return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
+			}
+			_ = data.Close()
+			size = sz
 		}
-		_ = data.Close()
 
 		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
 		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
@@ -163,33 +188,30 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Ino = nid
 				ino.Size = uint32(size)
 			} else {
-				fsys, ok := w.src.(fs.ReadLinkFS)
-				if !ok {
-					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
-				}
+				ino.Ino = nid
+				ino.Size = uint32(size)
 
-				info, err := fsys.Lstat(path)
-				if err != nil {
-					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
-				}
-				fsIno := getIno(info)
-
-				if entry, ok := w.linkMap[fsIno]; ok {
-					if w.linkMap[fsIno].Count == 0 {
-						ino.Ino = nid
-						entry.Count = 1
-						entry.Inode = uint64(ino.Ino)
-					} else {
-						// If this is a hard link, we reuse the inode number from the first
-						// file with the same fsInode.
-						ino.Ino = uint32(w.linkMap[fsIno].Inode)
-						entry.Count = w.linkMap[fsIno].Count + 1
+				if fsys, ok := w.src.(fs.ReadLinkFS); ok {
+					info, err := fsys.Lstat(path)
+					if err != nil {
+						return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
 					}
-					ino.Size = uint32(size)
+					fsIno := getIno(info)
 
-					w.linkMap[fsIno] = entry
-				} else {
-					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+					if fsIno != 0 {
+						if entry, ok := w.linkMap[fsIno]; ok {
+							if w.linkMap[fsIno].Count == 0 {
+								entry.Count = 1
+								entry.Inode = uint64(ino.Ino)
+							} else {
+								ino.Ino = uint32(w.linkMap[fsIno].Inode)
+								entry.Count = w.linkMap[fsIno].Count + 1
+							}
+							w.linkMap[fsIno] = entry
+						} else {
+							return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+						}
+					}
 				}
 			}
 			if inlined {
@@ -205,33 +227,30 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Ino = nid
 				ino.Size = uint64(size)
 			} else {
-				fsys, ok := w.src.(fs.ReadLinkFS)
-				if !ok {
-					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
-				}
+				ino.Ino = nid
+				ino.Size = uint64(size)
 
-				info, err := fsys.Lstat(path)
-				if err != nil {
-					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
-				}
-				fsIno := getIno(info)
-
-				if entry, ok := w.linkMap[fsIno]; ok {
-					if w.linkMap[fsIno].Count == 0 {
-						ino.Ino = nid
-						entry.Count = 1
-						entry.Inode = uint64(ino.Ino)
-					} else {
-						// If this is a hard link, we reuse the inode number from the first
-						// file with the same fsInode.
-						ino.Ino = uint32(w.linkMap[fsIno].Inode)
-						entry.Count = w.linkMap[fsIno].Count + 1
+				if fsys, ok := w.src.(fs.ReadLinkFS); ok {
+					info, err := fsys.Lstat(path)
+					if err != nil {
+						return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
 					}
-					ino.Size = uint64(size)
+					fsIno := getIno(info)
 
-					w.linkMap[fsIno] = entry
-				} else {
-					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+					if fsIno != 0 {
+						if entry, ok := w.linkMap[fsIno]; ok {
+							if w.linkMap[fsIno].Count == 0 {
+								entry.Count = 1
+								entry.Inode = uint64(ino.Ino)
+							} else {
+								ino.Ino = uint32(w.linkMap[fsIno].Inode)
+								entry.Count = w.linkMap[fsIno].Count + 1
+							}
+							w.linkMap[fsIno] = entry
+						} else {
+							return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+						}
+					}
 				}
 			}
 			if inlined {
@@ -362,6 +381,7 @@ func (w *writer) writeData() error {
 
 func (w *writer) populateInodes() error {
 	w.inodes = map[string]any{}
+	w.fileSizes = map[string]int64{}
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -409,6 +429,7 @@ func (w *writer) populateInodes() error {
 
 		w.inodes[path] = toInode(fi, nlink, w.opts.allRoot, originalFInfo)
 		w.inodeOrder = append(w.inodeOrder, path)
+		w.fileSizes[path] = fi.Size()
 
 		return nil
 	})
@@ -484,7 +505,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		names = append(names, "..")
 
 		for _, de := range entries {
-			path := filepath.Clean(filepath.Join(path, de.Name()))
+			path := filepath.Join(path, de.Name())
 			nid, err := w.findInodeAtPath(path)
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
@@ -497,22 +518,12 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 			names = append(names, de.Name())
 		}
 
-		// Sort the directory entries by name.
-		type pair struct {
-			d  Dirent
-			nm string
-		}
-		pairs := make([]pair, len(names))
-		for i := range names {
-			pairs[i] = pair{d: dirents[i], nm: names[i]}
-		}
-		sort.Slice(pairs, func(i, j int) bool {
-			return pairs[i].nm < pairs[j].nm
-		})
-		for i := range pairs {
-			dirents[i] = pairs[i].d
-			names[i] = pairs[i].nm
-		}
+		// EROFS requires directory entries in strict alphabetical order
+		// for binary search lookup. Sort all entries (including . and ..)
+		// by name. Previously . and .. were hardcoded at the front, which
+		// broke lookup for filenames starting with characters before '.'
+		// in ASCII (e.g. '#' = 0x23 < '.' = 0x2E).
+		sortDirents(dirents, names)
 
 		buf, err := encodeDirents(dirents, names)
 		if err != nil {
@@ -583,7 +594,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 
 	compact := fi.Size() <= math.MaxUint32 &&
 		uid <= math.MaxUint16 && gid <= math.MaxUint16 &&
-		fi.ModTime().Equal(time.Time{})
+		fi.ModTime().IsZero()
 
 	if compact {
 		return InodeCompact{
@@ -693,6 +704,17 @@ func offsetToNID(metaOffset int64) (uint32, error) {
 	return nid, nil
 }
 
+func inodeMode(ino any) uint16 {
+	switch ino := ino.(type) {
+	case InodeCompact:
+		return ino.Mode
+	case InodeExtended:
+		return ino.Mode
+	default:
+		return 0
+	}
+}
+
 func isInlined(ino any) bool {
 	var format uint16
 	switch ino := ino.(type) {
@@ -718,4 +740,15 @@ func roundUp(x, align int64) int64 {
 	}
 
 	return (x + align - 1) &^ (align - 1)
+}
+
+// sortDirents sorts dirents and names together by name, so that directory
+// entries are in strict alphabetical order as required by EROFS.
+func sortDirents(dirents []Dirent, names []string) {
+	for i := 1; i < len(dirents); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			dirents[j], dirents[j-1] = dirents[j-1], dirents[j]
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
 }

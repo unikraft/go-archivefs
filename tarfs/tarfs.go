@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"path/filepath"
+	"path"
 	"slices"
 	"strings"
 
@@ -26,6 +26,7 @@ var (
 	_ fs.FS                = (*FS)(nil)
 	_ fs.ReadDirFS         = (*FS)(nil)
 	_ fs.StatFS            = (*FS)(nil)
+	_ fs.ReadLinkFS        = (*FS)(nil)
 	_ archivefs.ReadLinkFS = (*FS)(nil)
 )
 
@@ -77,19 +78,19 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			if strings.HasPrefix(h.Linkname, "./") {
 				h.Linkname = strings.TrimPrefix(h.Linkname, ".")
 			}
-			h.Linkname = filepath.Clean(h.Linkname)
+			h.Linkname = path.Clean(h.Linkname)
 		}
 
 		// Create a default directory entry for each parent directory.
-		for dir := filepath.Dir(h.Name); dir != "." && dir != "/"; dir = filepath.Dir(dir) {
-			// Create a default directory entry if it doesn't exist.
-			// Don't worry if we see one later, we'll just overwrite it.
-			dirents[dir] = &dirent{
-				Header: tar.Header{
-					Typeflag: tar.TypeDir,
-					Name:     dir,
-					Mode:     0o755,
-				},
+		for dir := path.Dir(h.Name); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			if _, exists := dirents[dir]; !exists {
+				dirents[dir] = &dirent{
+					Header: tar.Header{
+						Typeflag: tar.TypeDir,
+						Name:     dir,
+						Mode:     0o755,
+					},
+				}
 			}
 		}
 
@@ -133,12 +134,12 @@ func Open(ra io.ReaderAt) (*FS, error) {
 		},
 	}
 
-	for _, path := range paths {
-		d := dirents[path]
+	for _, p := range paths {
+		d := dirents[p]
 
-		dir, err := resolve(&root, filepath.Dir(path))
+		dir, err := resolve(&root, path.Dir(p))
 		if err != nil {
-			return nil, fmt.Errorf("failed to resolve directory %q: %w", filepath.Dir(path), err)
+			return nil, fmt.Errorf("failed to resolve directory %q: %w", path.Dir(p), err)
 		}
 
 		dir.addChild(d)
@@ -148,9 +149,17 @@ func Open(ra io.ReaderAt) (*FS, error) {
 }
 
 func (fsys *FS) Open(name string) (fs.File, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, name)
 	if err != nil {
 		return nil, err
+	}
+
+	if d.IsDir() {
+		return &dirFile{dirent: d}, nil
 	}
 
 	tr := tar.NewReader(d.data())
@@ -162,6 +171,10 @@ func (fsys *FS) Open(name string) (fs.File, error) {
 }
 
 func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, name)
 	if err != nil {
 		return nil, err
@@ -180,6 +193,10 @@ func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	if sanitizePath(name) == "" {
 		d := &dirent{
 			Header: tar.Header{
@@ -208,12 +225,16 @@ func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
 // Experimental implementation of fs.ReadLinkFS:
 // https://github.com/golang/go/issues/49580
 func (fsys *FS) ReadLink(name string) (string, error) {
-	d, err := resolve(&fsys.root, filepath.Dir(name))
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+
+	d, err := resolve(&fsys.root, path.Dir(name))
 	if err != nil {
 		return "", err
 	}
 
-	d, found := d.findChild(filepath.Base(name))
+	d, found := d.findChild(path.Base(name))
 	if !found {
 		return "", fs.ErrNotExist
 	}
@@ -225,16 +246,17 @@ func (fsys *FS) ReadLink(name string) (string, error) {
 	return d.Linkname, nil
 }
 
-// StatLink returns a FileInfo describing the file without following any symbolic links.
-// Experimental implementation of fs.ReadLinkFS:
-// https://github.com/golang/go/issues/49580
-func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
-	d, err := resolve(&fsys.root, filepath.Dir(name))
+func (fsys *FS) Lstat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrInvalid}
+	}
+
+	d, err := resolve(&fsys.root, path.Dir(name))
 	if err != nil {
 		return nil, err
 	}
 
-	d, found := d.findChild(filepath.Base(name))
+	d, found := d.findChild(path.Base(name))
 	if !found {
 		return nil, fs.ErrNotExist
 	}
@@ -242,7 +264,36 @@ func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
 	return d.Info()
 }
 
+// StatLink returns a FileInfo describing the file without following any symbolic links.
+// Experimental implementation of fs.ReadLinkFS:
+// https://github.com/golang/go/issues/49580
+func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "statlink", Path: name, Err: fs.ErrInvalid}
+	}
+
+	d, err := resolve(&fsys.root, path.Dir(name))
+	if err != nil {
+		return nil, err
+	}
+
+	d, found := d.findChild(path.Base(name))
+	if !found {
+		return nil, fs.ErrNotExist
+	}
+
+	return d.Info()
+}
+
+// maxSymlinks is the maximum number of symlink resolutions allowed during
+// a single path resolution, matching the Linux kernel limit (MAXSYMLINKS).
+const maxSymlinks = 40
+
 func resolve(root *dirent, name string) (*dirent, error) {
+	return resolveDepth(root, name, maxSymlinks)
+}
+
+func resolveDepth(root *dirent, name string, remaining int) (*dirent, error) {
 	d := root
 
 	name = sanitizePath(name)
@@ -258,18 +309,22 @@ func resolve(root *dirent, name string) (*dirent, error) {
 		}
 
 		if d.Type()&fs.ModeSymlink != 0 {
+			if remaining <= 0 {
+				return nil, errors.New("too many levels of symbolic links")
+			}
+
 			// Resolve the symlink.
 			target := d.Linkname
 
 			var err error
-			if !filepath.IsAbs(target) && d.parent != nil {
-				d, err = resolve(d.parent, target)
+			if !strings.HasPrefix(target, "/") && d.parent != nil {
+				d, err = resolveDepth(d.parent, target, remaining-1)
 				if err != nil {
 					return nil, err
 				}
 			} else {
 				// The target is an absolute path or the dirent is the root dirent.
-				d, err = resolve(root, target)
+				d, err = resolveDepth(root, target, remaining-1)
 				if err != nil {
 					return nil, err
 				}
@@ -281,7 +336,74 @@ func resolve(root *dirent, name string) (*dirent, error) {
 }
 
 func sanitizePath(name string) string {
-	return strings.TrimPrefix(strings.TrimPrefix(filepath.Clean(filepath.ToSlash(strings.TrimSpace(name))), "."), "/")
+	name = strings.TrimSpace(name)
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = strings.ReplaceAll(name, "//", "/")
+
+	cleaned := path.Clean(name)
+	switch cleaned {
+	case ".", "/", "":
+		return ""
+	}
+
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	cleaned = strings.TrimPrefix(cleaned, "./")
+
+	if strings.HasPrefix(cleaned, "..") {
+		return ""
+	}
+
+	return cleaned
+}
+
+type dirFile struct {
+	*dirent
+	entries []fs.DirEntry
+	offset  int
+}
+
+func (f *dirFile) Stat() (fs.FileInfo, error) {
+	return f.Info()
+}
+
+func (f *dirFile) Read([]byte) (int, error) {
+	return 0, &fs.PathError{Op: "read", Path: f.Name(), Err: errors.New("is a directory")}
+}
+
+func (f *dirFile) Close() error {
+	return nil
+}
+
+func (f *dirFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	if f.entries == nil {
+		f.entries = make([]fs.DirEntry, 0, len(f.children))
+		for _, child := range f.children {
+			f.entries = append(f.entries, child)
+		}
+		slices.SortFunc(f.entries, func(a, b fs.DirEntry) int {
+			return strings.Compare(a.Name(), b.Name())
+		})
+	}
+
+	if n <= 0 {
+		entries := f.entries[f.offset:]
+		f.offset = len(f.entries)
+		return entries, nil
+	}
+
+	remaining := len(f.entries) - f.offset
+	if remaining == 0 {
+		return nil, io.EOF
+	}
+	if n > remaining {
+		n = remaining
+	}
+	entries := f.entries[f.offset : f.offset+n]
+	f.offset += n
+	if f.offset >= len(f.entries) {
+		return entries, io.EOF
+	}
+	return entries, nil
 }
 
 type file struct {
@@ -332,7 +454,7 @@ func (d *dirent) addChild(child *dirent) {
 }
 
 func (d *dirent) Name() string {
-	return filepath.Base(d.Header.Name)
+	return path.Base(d.Header.Name)
 }
 
 func (d *dirent) IsDir() bool {

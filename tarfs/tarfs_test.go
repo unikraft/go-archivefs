@@ -393,6 +393,11 @@ func TestTarFS(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, file := range v.files {
+				// Skip entries with names that are not valid fs.FS paths
+				// (e.g. non-UTF8 filenames, trailing slashes).
+				if !fs.ValidPath(file.Name) {
+					continue
+				}
 
 				var fi fs.FileInfo
 				var sum string
@@ -567,4 +572,215 @@ func TestTarFSCreate(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
+}
+
+func TestTarFSHiddenDirectories(t *testing.T) {
+	tempDir := t.TempDir()
+	tarPath := filepath.Join(tempDir, "hidden-dirs.tar")
+
+	tarFile, err := os.Create(tarPath)
+	require.NoError(t, err)
+
+	tw := tar.NewWriter(tarFile)
+
+	err = tw.WriteHeader(&tar.Header{
+		Name:     ".hidden/",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+		ModTime:  time.Now(),
+	})
+	require.NoError(t, err)
+
+	content := []byte("secret content")
+	err = tw.WriteHeader(&tar.Header{
+		Name:     ".hidden/file.txt",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(content)),
+		ModTime:  time.Now(),
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(content)
+	require.NoError(t, err)
+
+	err = tw.WriteHeader(&tar.Header{
+		Name:     ".hidden/nested/.config/",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+		ModTime:  time.Now(),
+	})
+	require.NoError(t, err)
+
+	configContent := []byte(`{"key": "value"}`)
+	err = tw.WriteHeader(&tar.Header{
+		Name:     ".hidden/nested/.config/settings.json",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(configContent)),
+		ModTime:  time.Now(),
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(configContent)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+	require.NoError(t, tarFile.Close())
+
+	tarFile, err = os.Open(tarPath)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, tarFile.Close())
+	})
+
+	fsys, err := tarfs.Open(tarFile)
+	require.NoError(t, err)
+
+	t.Run("StatHiddenDirectory", func(t *testing.T) {
+		fi, err := fsys.Stat(".hidden")
+		require.NoError(t, err)
+		require.True(t, fi.IsDir())
+		require.Equal(t, ".hidden", fi.Name())
+	})
+
+	t.Run("ReadHiddenDirectory", func(t *testing.T) {
+		entries, err := fsys.ReadDir(".hidden")
+		require.NoError(t, err)
+
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		require.Contains(t, names, "file.txt")
+		require.Contains(t, names, "nested")
+	})
+
+	t.Run("OpenFileInHiddenDirectory", func(t *testing.T) {
+		f, err := fsys.Open(".hidden/file.txt")
+		require.NoError(t, err)
+		defer f.Close()
+
+		data, err := io.ReadAll(f)
+		require.NoError(t, err)
+		require.Equal(t, "secret content", string(data))
+	})
+
+	t.Run("StatNestedHiddenDirectory", func(t *testing.T) {
+		fi, err := fsys.Stat(".hidden/nested/.config")
+		require.NoError(t, err)
+		require.True(t, fi.IsDir())
+		require.Equal(t, ".config", fi.Name())
+	})
+
+	t.Run("ReadNestedHiddenDirectory", func(t *testing.T) {
+		entries, err := fsys.ReadDir(".hidden/nested/.config")
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.Equal(t, "settings.json", entries[0].Name())
+	})
+
+	t.Run("OpenFileInNestedHiddenDirectory", func(t *testing.T) {
+		f, err := fsys.Open(".hidden/nested/.config/settings.json")
+		require.NoError(t, err)
+		defer f.Close()
+
+		data, err := io.ReadAll(f)
+		require.NoError(t, err)
+		require.Equal(t, `{"key": "value"}`, string(data))
+	})
+
+	t.Run("ReadDirRoot", func(t *testing.T) {
+		entries, err := fsys.ReadDir(".")
+		require.NoError(t, err)
+
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		require.Contains(t, names, ".hidden")
+	})
+}
+
+func TestTarFSPathTraversal(t *testing.T) {
+	tempDir := t.TempDir()
+	tarPath := filepath.Join(tempDir, "path-traversal.tar")
+
+	tarFile, err := os.Create(tarPath)
+	require.NoError(t, err)
+
+	tw := tar.NewWriter(tarFile)
+
+	maliciousPaths := []string{
+		"../../../etc/passwd",
+		"..",
+		"normal/../../../escape",
+		"./../../outside",
+	}
+
+	for _, path := range maliciousPaths {
+		content := []byte("malicious content")
+		err = tw.WriteHeader(&tar.Header{
+			Name:     path,
+			Typeflag: tar.TypeReg,
+			Mode:     0o644,
+			Size:     int64(len(content)),
+			ModTime:  time.Now(),
+		})
+		require.NoError(t, err)
+		_, err = tw.Write(content)
+		require.NoError(t, err)
+	}
+
+	legitContent := []byte("safe content")
+	err = tw.WriteHeader(&tar.Header{
+		Name:     "safe.txt",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(legitContent)),
+		ModTime:  time.Now(),
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(legitContent)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+	require.NoError(t, tarFile.Close())
+
+	tarFile, err = os.Open(tarPath)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, tarFile.Close())
+	})
+
+	fsys, err := tarfs.Open(tarFile)
+	require.NoError(t, err)
+
+	t.Run("MaliciousPathsRejected", func(t *testing.T) {
+		for _, path := range maliciousPaths {
+			_, err := fsys.Stat(path)
+			if err == nil {
+				fi, statErr := fsys.Stat(path)
+				require.NoError(t, statErr)
+				require.True(t, fi.IsDir(), "malicious path %q should resolve to directory (root), not a file", path)
+			} else {
+				require.Error(t, err, "malicious path %q should be rejected", path)
+			}
+		}
+	})
+
+	t.Run("LegitimateFileAccessible", func(t *testing.T) {
+		f, err := fsys.Open("safe.txt")
+		require.NoError(t, err)
+		defer f.Close()
+
+		data, err := io.ReadAll(f)
+		require.NoError(t, err)
+		require.Equal(t, "safe content", string(data))
+	})
+
+	t.Run("RootDirectoryOnlyShowsSafeFile", func(t *testing.T) {
+		entries, err := fsys.ReadDir(".")
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.Equal(t, "safe.txt", entries[0].Name())
+	})
 }

@@ -65,28 +65,46 @@ func Open(src io.ReaderAt) (*Filesystem, error) {
 }
 
 func (fsys *Filesystem) Open(name string) (fs.File, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, false)
 	if err != nil {
 		return nil, err
 	}
 
+	if de.IsDir() {
+		return &dirFile{
+			fsys: fsys,
+			de:   de,
+			name: name,
+		}, nil
+	}
+
 	return &file{
-		image: fsys.image,
-		de:    de,
+		de: de,
 	}, nil
 }
 
 func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, false)
 	if err != nil {
 		return nil, err
 	}
 
 	if !de.IsDir() {
-		return nil, errors.New("not a directory")
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: errors.New("not a directory")}
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	var dirents []fs.DirEntry
 	err = ino.IterDirents(func(name string, typ uint8, nid uint64) error {
@@ -112,12 +130,19 @@ func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 func (fsys *Filesystem) Stat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, false)
 	if err != nil {
 		return nil, err
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -129,25 +154,40 @@ func (fsys *Filesystem) Stat(name string) (fs.FileInfo, error) {
 // ReadLink returns the destination of the named symbolic link.
 // Experimental implementation of: https://github.com/golang/go/issues/49580
 func (fsys *Filesystem) ReadLink(name string) (string, error) {
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, true)
 	if err != nil {
 		return "", err
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return "", de.inodeErr
+	}
 
 	return ino.Readlink()
 }
 
 func (fsys *Filesystem) Lstat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, true)
 	if err != nil {
 		return nil, err
 	}
 
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	return &fileInfo{
+		image: de.image,
 		name:  de.name,
 		inode: ino,
 	}, nil
@@ -159,7 +199,15 @@ func (fsys *Filesystem) StatLink(name string) (fs.FileInfo, error) {
 	return fsys.Lstat(name)
 }
 
+// maxSymlinks is the maximum number of symlink resolutions allowed during
+// a single path resolution, matching the Linux kernel limit (MAXSYMLINKS).
+const maxSymlinks = 40
+
 func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEntry, error) {
+	return fsys.resolveDepth(name, noResolveLastSymlink, maxSymlinks)
+}
+
+func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, remaining int) (*dirEntry, error) {
 	de := fsys.root
 
 	components := splitPath(name)
@@ -170,8 +218,15 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 		}
 
 		ino := child.getInode()
+		if child.inodeErr != nil {
+			return nil, child.inodeErr
+		}
 
 		if ino.IsSymlink() && !(noResolveLastSymlink && i == len(components)-1) {
+			if remaining <= 0 {
+				return nil, errors.New("too many levels of symbolic links")
+			}
+
 			link, err := ino.Readlink()
 			if err != nil {
 				return nil, err
@@ -184,7 +239,7 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 				link = filepath.Join(strings.Join(components[:i], "/"), link)
 			}
 
-			child, err = fsys.resolve(link, noResolveLastSymlink)
+			child, err = fsys.resolveDepth(link, noResolveLastSymlink, remaining-1)
 			if err != nil {
 				return nil, err
 			}
@@ -195,18 +250,69 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 	return de, nil
 }
 
+type dirFile struct {
+	fsys    *Filesystem
+	de      *dirEntry
+	name    string
+	entries []fs.DirEntry
+	offset  int
+}
+
+func (f *dirFile) Stat() (fs.FileInfo, error) {
+	return f.de.Info()
+}
+
+func (f *dirFile) Read([]byte) (int, error) {
+	return 0, &fs.PathError{Op: "read", Path: f.name, Err: errors.New("is a directory")}
+}
+
+func (f *dirFile) Close() error {
+	return nil
+}
+
+func (f *dirFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	if f.entries == nil {
+		entries, err := f.fsys.ReadDir(f.name)
+		if err != nil {
+			return nil, err
+		}
+		f.entries = entries
+	}
+
+	if n <= 0 {
+		entries := f.entries[f.offset:]
+		f.offset = len(f.entries)
+		return entries, nil
+	}
+
+	remaining := len(f.entries) - f.offset
+	if remaining == 0 {
+		return nil, io.EOF
+	}
+	if n > remaining {
+		n = remaining
+	}
+	entries := f.entries[f.offset : f.offset+n]
+	f.offset += n
+	if f.offset >= len(f.entries) {
+		return entries, io.EOF
+	}
+	return entries, nil
+}
+
 type file struct {
-	image *Image
-	de    *dirEntry
-	r     io.Reader
+	de *dirEntry
+	r  io.Reader
 }
 
 func (f *file) Read(p []byte) (int, error) {
 	if f.r == nil {
-		var err error
-
 		ino := f.de.getInode()
+		if f.de.inodeErr != nil {
+			return 0, f.de.inodeErr
+		}
 
+		var err error
 		f.r, err = ino.Data()
 		if err != nil {
 			return 0, err
@@ -231,6 +337,7 @@ type dirEntry struct {
 	nid           uint64
 	readInodeOnce sync.Once
 	inode         *Inode
+	inodeErr      error
 }
 
 func (de *dirEntry) Name() string {
@@ -242,13 +349,29 @@ func (de *dirEntry) IsDir() bool {
 }
 
 func (de *dirEntry) Type() fs.FileMode {
-	ino := de.getInode()
-
-	return ino.Mode()
+	switch de.typ {
+	case FT_DIR:
+		return fs.ModeDir
+	case FT_SYMLINK:
+		return fs.ModeSymlink
+	case FT_CHRDEV:
+		return fs.ModeDevice | fs.ModeCharDevice
+	case FT_BLKDEV:
+		return fs.ModeDevice
+	case FT_FIFO:
+		return fs.ModeNamedPipe
+	case FT_SOCK:
+		return fs.ModeSocket
+	default:
+		return 0
+	}
 }
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	return &fileInfo{
 		image: de.image,
@@ -259,6 +382,9 @@ func (de *dirEntry) Info() (fs.FileInfo, error) {
 
 func (de *dirEntry) lookup(name string) (*dirEntry, error) {
 	ino := de.getInode()
+	if de.inodeErr != nil {
+		return nil, de.inodeErr
+	}
 
 	d, err := ino.Lookup(name)
 	if err != nil {
@@ -277,11 +403,15 @@ func (de *dirEntry) getInode() Inode {
 	de.readInodeOnce.Do(func() {
 		ino, err := de.image.Inode(de.nid)
 		if err != nil {
-			panic(err)
+			de.inodeErr = err
+			return
 		}
 		de.inode = &ino
 	})
 
+	if de.inode == nil {
+		return Inode{}
+	}
 	return *de.inode
 }
 
@@ -304,7 +434,7 @@ func (fi *fileInfo) Mode() fs.FileMode {
 }
 
 func (fi *fileInfo) ModTime() time.Time {
-	return time.Unix(int64(fi.inode.Mtime()), 0)
+	return time.Unix(int64(fi.inode.Mtime()), int64(fi.inode.MtimeNsec()))
 }
 
 func (fi *fileInfo) IsDir() bool {

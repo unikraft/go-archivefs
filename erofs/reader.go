@@ -79,10 +79,7 @@ const (
 )
 
 // Features w/ backward compatibility.
-// This is not exhaustive, unused features are not listed.
-const (
-	FeatureCompatSuperBlockChecksum = 0x00000001
-)
+// Constants defined in constants.go (EROFS_FEATURE_COMPAT_*).
 
 // Features w/o backward compatibility.
 //
@@ -241,7 +238,7 @@ func (i *Image) initSuperBlock() error {
 
 // verifyChecksum verifies the checksum of the superblock.
 func (i *Image) verifyChecksum() error {
-	if i.sb.FeatureCompat&FeatureCompatSuperBlockChecksum == 0 {
+	if i.sb.FeatureCompat&EROFS_FEATURE_COMPAT_SB_CHKSUM == 0 {
 		return nil
 	}
 
@@ -258,7 +255,7 @@ func (i *Image) verifyChecksum() error {
 
 	off := SuperBlockOffset + int64(binary.Size(i.sb))
 	if buf, err := i.bytesAt(off, int64(i.BlockSize())-off); err != nil {
-		return errors.New("image size is too small")
+		return fmt.Errorf("failed to read checksum block: %w", err)
 	} else {
 		checksum = ^crc32.Update(checksum, table, buf)
 	}
@@ -583,7 +580,7 @@ func (ino *Inode) Mode() fs.FileMode {
 		mode |= fs.ModeDir
 	}
 	if ino.IsCharDev() {
-		mode |= fs.ModeCharDevice
+		mode |= fs.ModeDevice | fs.ModeCharDevice
 	}
 	if ino.IsBlockDev() {
 		mode |= fs.ModeDevice
@@ -596,6 +593,15 @@ func (ino *Inode) Mode() fs.FileMode {
 	}
 	if ino.IsSymlink() {
 		mode |= fs.ModeSymlink
+	}
+	if ino.mode&S_ISUID != 0 {
+		mode |= fs.ModeSetuid
+	}
+	if ino.mode&S_ISGID != 0 {
+		mode |= fs.ModeSetgid
+	}
+	if ino.mode&S_ISVTX != 0 {
+		mode |= fs.ModeSticky
 	}
 
 	return mode
