@@ -17,8 +17,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dpeckett/archivefs/arfs"
-	"github.com/dpeckett/archivefs/internal/testutil"
+	"github.com/unikraft/go-archivefs/arfs"
+	"github.com/unikraft/go-archivefs/internal/testutil"
 
 	"github.com/stretchr/testify/require"
 )

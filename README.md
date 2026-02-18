@@ -18,7 +18,7 @@ import (
   "log"
   "os"
 
-  "github.com/dpeckett/archivefs/tarfs"
+  "github.com/unikraft/go-archivefs/tarfs"
 )
 
 func main() {

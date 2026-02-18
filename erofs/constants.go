@@ -45,17 +45,17 @@ func fileTypeFromFileMode(mode fs.FileMode) uint8 {
 
 // Values for mode_t.
 const (
-	S_IFMT   = 0170000
-	S_IFSOCK = 0140000
-	S_IFLNK  = 0120000
-	S_IFREG  = 0100000
-	S_IFBLK  = 060000
-	S_IFDIR  = 040000
-	S_IFCHR  = 020000
-	S_IFIFO  = 010000
-	S_ISUID  = 04000
-	S_ISGID  = 02000
-	S_ISVTX  = 01000
+	S_IFMT   = 0o170000
+	S_IFSOCK = 0o140000
+	S_IFLNK  = 0o120000
+	S_IFREG  = 0o100000
+	S_IFBLK  = 0o60000
+	S_IFDIR  = 0o40000
+	S_IFCHR  = 0o20000
+	S_IFIFO  = 0o10000
+	S_ISUID  = 0o4000
+	S_ISGID  = 0o2000
+	S_ISVTX  = 0o1000
 )
 
 func statModeFromFileMode(mode fs.FileMode) uint16 {
@@ -91,3 +91,10 @@ func statModeFromFileMode(mode fs.FileMode) uint16 {
 
 	return stMode
 }
+
+// EROFS feature compatibility flags.
+const (
+	EROFS_FEATURE_COMPAT_SB_CHKSUM = 1 << iota
+	EROFS_FEATURE_COMPAT_MTIME
+	EROFS_FEATURE_COMPAT_XATTR_FILTER
+)

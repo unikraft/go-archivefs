@@ -12,29 +12,39 @@ package erofs
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
-	BlockSize         = 4096
-	BlockSizeBits     = 12
-	InodeSlotSize     = 1 << InodeSlotBits
-	MaxInlineDataSize = BlockSize / 4
+	BlockSize     = 4096
+	BlockSizeBits = 12
+	InodeSlotSize = 1 << InodeSlotBits
+	// MaxInlineDataSize = BlockSize / 4
+	// We change this to 0 to represent the flag '-E noinline_data'
+	MaxInlineDataSize = 0
 )
 
 // Create creates an EROFS filesystem image from the source filesystem and writes
 // it to the destination writer.
-func Create(dst io.WriterAt, src fs.FS) error {
+func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 	w := &writer{
 		src: src,
 		dst: dst,
+	}
+
+	for _, opt := range opts {
+		if err := opt(&w.opts); err != nil {
+			return err
+		}
 	}
 
 	return w.write()
@@ -45,9 +55,18 @@ type writer struct {
 	dst        io.WriterAt
 	inodes     map[string]any
 	inodeOrder []string
+	linkMap    map[uint64]inodeCount
+	opts       ErofsCreateOptions
+}
+
+type inodeCount struct {
+	Count int
+	Inode uint64
 }
 
 func (w *writer) write() error {
+	w.linkMap = map[uint64]inodeCount{}
+
 	if err := w.populateInodes(); err != nil {
 		return fmt.Errorf("failed to populate inodes: %w", err)
 	}
@@ -68,12 +87,26 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write data blocks: %w", err)
 	}
 
+	// Generate a UUID for the filesystem.
+	uuidBytes, err := uuid.New().MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("failed to generate UUID: %w", err)
+	}
+	var uuid [16]uint8
+	copy(uuid[:], uuidBytes)
+
+	timeNow := time.Now()
+
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
 		BlockSizeBits: BlockSizeBits,
 		Inodes:        uint64(len(w.inodes)),
 		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
+		UUID:          uuid,
+		BuildTime:     uint64(timeNow.Unix()),
+		BuildTimeNsec: uint32(timeNow.Nanosecond()),
+		FeatureCompat: EROFS_FEATURE_COMPAT_SB_CHKSUM | EROFS_FEATURE_COMPAT_MTIME,
 		// TODO: other fields (volume name, etc.)
 	}
 
@@ -105,7 +138,9 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 		}
 		_ = data.Close()
 
-		inlined := size <= MaxInlineDataSize
+		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
+		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
+		inlined := size > 0 && size <= MaxInlineDataSize
 		if inlined {
 			// if the size of the inode and data exceeds the block size, we need to
 			// pad to the next block boundary before inlining the data.
@@ -124,8 +159,39 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 
 		switch ino := ino.(type) {
 		case InodeCompact:
-			ino.Ino = nid
-			ino.Size = uint32(size)
+			if ino.Mode&S_IFMT == S_IFDIR {
+				ino.Ino = nid
+				ino.Size = uint32(size)
+			} else {
+				fsys, ok := w.src.(fs.ReadLinkFS)
+				if !ok {
+					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
+				}
+
+				info, err := fsys.Lstat(path)
+				if err != nil {
+					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
+				}
+				fsIno := getIno(info)
+
+				if entry, ok := w.linkMap[fsIno]; ok {
+					if w.linkMap[fsIno].Count == 0 {
+						ino.Ino = nid
+						entry.Count = 1
+						entry.Inode = uint64(ino.Ino)
+					} else {
+						// If this is a hard link, we reuse the inode number from the first
+						// file with the same fsInode.
+						ino.Ino = uint32(w.linkMap[fsIno].Inode)
+						entry.Count = w.linkMap[fsIno].Count + 1
+					}
+					ino.Size = uint32(size)
+
+					w.linkMap[fsIno] = entry
+				} else {
+					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+				}
+			}
 			if inlined {
 				ino.Format = setBits(ino.Format, InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits)
 			} else {
@@ -135,8 +201,39 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			w.inodes[path] = ino
 
 		case InodeExtended:
-			ino.Ino = nid
-			ino.Size = uint64(size)
+			if ino.Mode&S_IFMT == S_IFDIR {
+				ino.Ino = nid
+				ino.Size = uint64(size)
+			} else {
+				fsys, ok := w.src.(fs.ReadLinkFS)
+				if !ok {
+					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
+				}
+
+				info, err := fsys.Lstat(path)
+				if err != nil {
+					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
+				}
+				fsIno := getIno(info)
+
+				if entry, ok := w.linkMap[fsIno]; ok {
+					if w.linkMap[fsIno].Count == 0 {
+						ino.Ino = nid
+						entry.Count = 1
+						entry.Inode = uint64(ino.Ino)
+					} else {
+						// If this is a hard link, we reuse the inode number from the first
+						// file with the same fsInode.
+						ino.Ino = uint32(w.linkMap[fsIno].Inode)
+						entry.Count = w.linkMap[fsIno].Count + 1
+					}
+					ino.Size = uint64(size)
+
+					w.linkMap[fsIno] = entry
+				} else {
+					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+				}
+			}
 			if inlined {
 				ino.Format = setBits(ino.Format, InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits)
 			} else {
@@ -284,9 +381,33 @@ func (w *writer) populateInodes() error {
 			}
 
 			nlink = len(entries) + 2
+		} else {
+			nlink = getNLinks(fi)
+			ino := getIno(fi)
+			if _, ok := w.linkMap[ino]; !ok {
+				w.linkMap[ino] = inodeCount{
+					Count: 0,
+				}
+			}
 		}
 
-		w.inodes[path] = toInode(fi, nlink)
+		var originalFInfo *FileInfo
+		if w.opts.fInfoMap != nil {
+			// DirFS believes this is the root directory, so we set as such
+			toCheckForName := filepath.Join("/", path)
+
+			if filepath.Base(path) == ".." {
+				toCheckForName = filepath.Dir(filepath.Dir(path))
+			} else if filepath.Base(path) == "." {
+				toCheckForName = filepath.Dir(path)
+			}
+
+			if finfo, ok := w.opts.fInfoMap[toCheckForName]; ok {
+				originalFInfo = &finfo
+			}
+		}
+
+		w.inodes[path] = toInode(fi, nlink, w.opts.allRoot, originalFInfo)
 		w.inodeOrder = append(w.inodeOrder, path)
 
 		return nil
@@ -299,10 +420,6 @@ func (w *writer) populateInodes() error {
 }
 
 func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error) {
-	type readLinkFS interface {
-		ReadLink(name string) (string, error)
-	}
-
 	var mode uint16
 	switch ino := ino.(type) {
 	case InodeCompact:
@@ -334,37 +451,67 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 			return nil, 0, fmt.Errorf("failed to read directory entries: %w", err)
 		}
 
-		dirents := []Dirent{{FileType: uint8(fileTypeFromFileMode(fs.ModeDir))}}
+		// Add information about the directory itself.
+		rootNid, err := w.findInodeAtPath(path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
+		}
+		dirents := []Dirent{
+			{
+				Nid:      rootNid,
+				FileType: uint8(fileTypeFromFileMode(fs.ModeDir)),
+			},
+		}
 		names := []string{"."}
 
+		// Add information about the parent directory.
 		if path != "." {
-			dirents = append(dirents, Dirent{FileType: uint8(fileTypeFromFileMode(fs.ModeDir))})
-			names = append(names, "..")
+			parentNid, err := w.findInodeAtPath(filepath.Join(path, ".."))
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
+			}
+			dirents = append(dirents, Dirent{
+				Nid:      parentNid,
+				FileType: uint8(fileTypeFromFileMode(fs.ModeDir)),
+			})
+		} else {
+			// The parent is the root directory itself in that case
+			dirents = append(dirents, Dirent{
+				Nid:      rootNid,
+				FileType: uint8(fileTypeFromFileMode(fs.ModeDir)),
+			})
 		}
+		names = append(names, "..")
 
 		for _, de := range entries {
 			path := filepath.Clean(filepath.Join(path, de.Name()))
-
-			ino, ok := w.inodes[path]
-			if !ok {
-				return nil, 0, fmt.Errorf("failed to find inode for path %q", path)
-			}
-
-			var nid uint32
-			switch ino := ino.(type) {
-			case InodeCompact:
-				nid = ino.Ino
-			case InodeExtended:
-				nid = ino.Ino
-			default:
-				return nil, 0, fmt.Errorf("unsupported inode type %T", ino)
+			nid, err := w.findInodeAtPath(path)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 			}
 
 			dirents = append(dirents, Dirent{
-				Nid:      uint64(nid),
+				Nid:      nid,
 				FileType: uint8(fileTypeFromFileMode(de.Type())),
 			})
 			names = append(names, de.Name())
+		}
+
+		// Sort the directory entries by name.
+		type pair struct {
+			d  Dirent
+			nm string
+		}
+		pairs := make([]pair, len(names))
+		for i := range names {
+			pairs[i] = pair{d: dirents[i], nm: names[i]}
+		}
+		sort.Slice(pairs, func(i, j int) bool {
+			return pairs[i].nm < pairs[j].nm
+		})
+		for i := range pairs {
+			dirents[i] = pairs[i].d
+			names[i] = pairs[i].nm
 		}
 
 		buf, err := encodeDirents(dirents, names)
@@ -375,9 +522,9 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		return io.NopCloser(bytes.NewReader(buf)), int64(len(buf)), nil
 
 	case S_IFLNK:
-		fsys, ok := w.src.(readLinkFS)
+		fsys, ok := w.src.(fs.ReadLinkFS)
 		if !ok {
-			return nil, 0, errors.New("source filesystem must implement readLinkFS")
+			return nil, 0, fmt.Errorf("source filesystem must implement readLinkFS")
 		}
 
 		target, err := fsys.ReadLink(path)
@@ -394,18 +541,54 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 	}
 }
 
-func toInode(fi fs.FileInfo, nlink int) any {
-	uid, gid := getOwner(fi)
+func (w *writer) findInodeAtPath(path string) (uint64, error) {
+	cleanPath := filepath.Clean(path)
 
-	// Can we use a compact inode?
+	ino, ok := w.inodes[cleanPath]
+	if !ok {
+		return 0, fmt.Errorf("failed to find inode for path %q", path)
+	}
+
+	var nid uint32
+	switch ino := ino.(type) {
+	case InodeCompact:
+		nid = ino.Ino
+	case InodeExtended:
+		nid = ino.Ino
+	default:
+		return 0, fmt.Errorf("unsupported inode type %T", ino)
+	}
+
+	return uint64(nid), nil
+}
+
+func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) any {
+	var uid, gid int
+	mode := fi.Mode()
+
+	switch {
+	case allRoot:
+		uid, gid = 0, 0
+	case originalFInfo != nil:
+		uid = originalFInfo.Uid
+		gid = originalFInfo.Gid
+	default:
+		uid, gid = getOwner(fi)
+	}
+
+	// Clear permission bits from 'mode' and set the ones from originalFInfo.mode
+	if originalFInfo != nil {
+		mode = mode&^fs.ModePerm | originalFInfo.Mode.Perm()
+	}
+
 	compact := fi.Size() <= math.MaxUint32 &&
 		uid <= math.MaxUint16 && gid <= math.MaxUint16 &&
-		fi.ModTime() == time.Time{}
+		fi.ModTime().Equal(time.Time{})
 
 	if compact {
 		return InodeCompact{
 			Format: setBits(0, InodeLayoutCompact, InodeLayoutBit, InodeLayoutBits),
-			Mode:   statModeFromFileMode(fi.Mode()),
+			Mode:   statModeFromFileMode(mode),
 			Nlink:  uint16(nlink),
 			UID:    uint16(uid),
 			GID:    uint16(gid),
@@ -414,7 +597,7 @@ func toInode(fi fs.FileInfo, nlink int) any {
 
 	return InodeExtended{
 		Format:    setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
-		Mode:      statModeFromFileMode(fi.Mode()),
+		Mode:      statModeFromFileMode(mode),
 		Nlink:     uint32(nlink),
 		UID:       uint32(uid),
 		GID:       uint32(gid),

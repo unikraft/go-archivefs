@@ -15,7 +15,7 @@ import (
 	"io"
 	"io/fs"
 
-	"github.com/dpeckett/archivefs"
+	"github.com/unikraft/go-archivefs"
 )
 
 // Create creates a tar archive from the given filesystem.

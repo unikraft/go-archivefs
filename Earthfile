@@ -39,8 +39,8 @@ package:
   RUN apt install -y \
     golang-github-rogpeppe-go-internal-dev \
     golang-github-stretchr-testify-dev
-  RUN mkdir -p /workspace/golang-github-dpeckett-archivefs
-  WORKDIR /workspace/golang-github-dpeckett-archivefs
+  RUN mkdir -p /workspace/golang-github-unikraft-archivefs
+  WORKDIR /workspace/golang-github-unikraft-archivefs
   COPY . .
   RUN if [ -n "$(git status --porcelain)" ]; then echo "Please commit your changes."; exit 1; fi
   RUN if [ -z "$(git describe --tags --exact-match 2>/dev/null)" ]; then echo "Current commit is not tagged."; exit 1; fi
@@ -50,6 +50,6 @@ package:
   ENV DEBFULLNAME="Damian Peckett"
   RUN /usr/local/bin/generate-changelog.sh
   RUN VERSION=$(git describe --tags --abbrev=0 | tr -d 'v') \
-    && tar -czf ../golang-github-dpeckett-archivefs_${VERSION}.orig.tar.gz .
+    && tar -czf ../golang-github-unikraft-archivefs_${VERSION}.orig.tar.gz .
   RUN dpkg-buildpackage -us -uc
   SAVE ARTIFACT /workspace/*.deb AS LOCAL dist/

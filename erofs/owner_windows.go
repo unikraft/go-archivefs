@@ -28,3 +28,25 @@ func getOwner(fi fs.FileInfo) (uid, gid int) {
 
 	return
 }
+
+func getNLinks(fi fs.FileInfo) int {
+	switch fi.Sys().(type) {
+	case *Inode:
+		inode := fi.Sys().(*Inode)
+
+		return int(inode.Nlink())
+	}
+
+	return 1
+}
+
+func getIno(fi fs.FileInfo) uint64 {
+	switch fi.Sys().(type) {
+	case *Inode:
+		inode := fi.Sys().(*Inode)
+
+		return inode.Nid()
+	}
+
+	return 0
+}

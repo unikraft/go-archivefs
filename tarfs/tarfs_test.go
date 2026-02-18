@@ -52,8 +52,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dpeckett/archivefs/internal/testutil"
-	"github.com/dpeckett/archivefs/tarfs"
+	"github.com/unikraft/go-archivefs/internal/testutil"
+	"github.com/unikraft/go-archivefs/tarfs"
 	"github.com/stretchr/testify/require"
 )
 

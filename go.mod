@@ -1,8 +1,9 @@
-module github.com/dpeckett/archivefs
+module github.com/unikraft/go-archivefs
 
-go 1.22.0
+go 1.24.0
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/rogpeppe/go-internal v1.9.0
 	github.com/stretchr/testify v1.8.1
 )

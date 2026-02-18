@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dpeckett/archivefs/erofs"
+	"github.com/unikraft/go-archivefs/erofs"
 	"github.com/rogpeppe/go-internal/dirhash"
 
 	"github.com/stretchr/testify/require"
