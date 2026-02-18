@@ -247,6 +247,7 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	f.content = bytes.NewBuffer(data)
+	f.size = int64(len(data))
 	f.perm = perm
 	return nil
 }
@@ -277,6 +278,7 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 		handle := &File{
 			name:    cc.name,
 			perm:    cc.perm,
+			size:    int64(cc.content.Len()),
 			content: bytes.NewBuffer(cc.content.Bytes()),
 		}
 		return handle, nil
@@ -384,6 +386,7 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 type File struct {
 	name    string
 	perm    os.FileMode
+	size    int64
 	content *bytes.Buffer
 	modTime time.Time
 	closed  bool
@@ -395,7 +398,7 @@ func (f *File) Stat() (fs.FileInfo, error) {
 	}
 	fi := fileInfo{
 		name:    f.name,
-		size:    int64(f.content.Len()),
+		size:    f.size,
 		modTime: f.modTime,
 		mode:    f.perm,
 	}
