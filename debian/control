@@ -1,4 +1,4 @@
-Source: golang-github-dpeckett-archivefs
+Source: golang-github-unikraft-archivefs
 Section: golang
 Priority: optional
 Maintainer: Damian Peckett <damian@pecke.tt>
@@ -11,12 +11,12 @@ Build-Depends: debhelper-compat (= 13),
                golang-github-stretchr-testify-dev
 Testsuite: autopkgtest-pkg-go
 Standards-Version: 4.6.2
-Vcs-Browser: https://github.com/dpeckett/archivefs
-Vcs-Git: https://github.com/dpeckett/archivefs.git
-Homepage: https://github.com/dpeckett/archivefs
-XS-Go-Import-Path: github.com/dpeckett/archivefs
+Vcs-Browser: https://github.com/unikraft/go-archivefs
+Vcs-Git: https://github.com/unikraft/go-archivefs.git
+Homepage: https://github.com/unikraft/go-archivefs
+XS-Go-Import-Path: github.com/unikraft/go-archivefs
 
-Package: golang-github-dpeckett-archivefs-dev
+Package: golang-github-unikraft-archivefs-dev
 Architecture: all
 Multi-Arch: foreign
 Depends: golang-github-rogpeppe-go-internal-dev,

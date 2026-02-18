@@ -1,4 +1,4 @@
-module github.com/dpeckett/archivefs
+module github.com/unikraft/go-archivefs
 
 go 1.24.0
 

@@ -19,7 +19,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/dpeckett/archivefs"
+	"github.com/unikraft/go-archivefs"
 )
 
 var (

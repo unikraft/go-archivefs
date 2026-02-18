@@ -45,7 +45,7 @@ import (
 	"io/fs"
 	"testing"
 
-	"github.com/dpeckett/archivefs/memfs"
+	"github.com/unikraft/go-archivefs/memfs"
 
 	"github.com/stretchr/testify/require"
 )
