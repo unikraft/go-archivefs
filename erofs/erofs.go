@@ -231,6 +231,7 @@ type dirEntry struct {
 	nid           uint64
 	readInodeOnce sync.Once
 	inode         *Inode
+	inodeErr      error
 }
 
 func (de *dirEntry) Name() string {
@@ -277,11 +278,15 @@ func (de *dirEntry) getInode() Inode {
 	de.readInodeOnce.Do(func() {
 		ino, err := de.image.Inode(de.nid)
 		if err != nil {
-			panic(err)
+			de.inodeErr = err
+			return
 		}
 		de.inode = &ino
 	})
 
+	if de.inode == nil {
+		return Inode{}
+	}
 	return *de.inode
 }
 

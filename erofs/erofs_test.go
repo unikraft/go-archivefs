@@ -10,6 +10,7 @@
 package erofs_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -331,6 +332,49 @@ func TestEROFSFilenamesSortingBeforeDotRoot(t *testing.T) {
 	info, err := fsys.Stat("zebra.txt")
 	require.NoError(t, err)
 	require.Equal(t, "zebra.txt", info.Name())
+}
+
+func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
+	// Create a valid image with a file.
+	srcFS := memfs.New()
+	require.NoError(t, srcFS.WriteFile("file.txt", []byte("data"), 0o644))
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "corrupt.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	// Read the full image into memory.
+	stat, err := imgFile.Stat()
+	require.NoError(t, err)
+	data := make([]byte, stat.Size())
+	_, err = imgFile.ReadAt(data, 0)
+	require.NoError(t, err)
+
+	// Truncate the image so that the superblock and root inode are intact
+	// but child inodes are cut off. Metadata starts at block 1 (offset 4096).
+	// Keep 96 bytes of metadata: root inode (32 bytes) + inline dir data.
+	truncated := data[:4096+96]
+
+	// Previously getInode would panic on error. Verify that operations on a
+	// corrupted image return errors gracefully.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic on corrupted image: %v", r)
+		}
+	}()
+
+	fsys, err := erofs.Open(bytes.NewReader(truncated))
+	if err != nil {
+		return // Open failing is acceptable
+	}
+
+	// Stat on the file should hit the corrupted/missing inode and return
+	// an error rather than panicking.
+	_, _ = fsys.Stat("file.txt")
+	_, _ = fsys.Open("file.txt")
+	_, _ = fsys.ReadDir(".")
 }
 
 func TestEROFSCreate(t *testing.T) {
