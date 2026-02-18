@@ -43,7 +43,7 @@ func TestEROFS(t *testing.T) {
 
 	t.Run("Open", func(t *testing.T) {
 		t.Run("File", func(t *testing.T) {
-			f, err := fsys.Open("/usr/bin/toybox")
+			f, err := fsys.Open("usr/bin/toybox")
 			require.NoError(t, err)
 			t.Cleanup(func() {
 				require.NoError(t, f.Close())
@@ -93,7 +93,7 @@ func TestEROFS(t *testing.T) {
 	})
 
 	t.Run("ReadDir", func(t *testing.T) {
-		entries, err := fsys.ReadDir("/etc")
+		entries, err := fsys.ReadDir("etc")
 		require.NoError(t, err)
 
 		require.Len(t, entries, 5)
@@ -121,7 +121,7 @@ func TestEROFS(t *testing.T) {
 
 	t.Run("Stat", func(t *testing.T) {
 		t.Run("File", func(t *testing.T) {
-			info, err := fsys.Stat("/usr/bin/toybox")
+			info, err := fsys.Stat("usr/bin/toybox")
 			require.NoError(t, err)
 
 			require.Equal(t, "toybox", info.Name())

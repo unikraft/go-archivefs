@@ -67,6 +67,10 @@ func Open(src io.ReaderAt) (*Filesystem, error) {
 }
 
 func (fsys *Filesystem) Open(name string) (fs.File, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, false)
 	if err != nil {
 		return nil, err
@@ -78,6 +82,10 @@ func (fsys *Filesystem) Open(name string) (fs.File, error) {
 }
 
 func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, false)
 	if err != nil {
 		return nil, err
@@ -113,6 +121,10 @@ func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 func (fsys *Filesystem) Stat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, false)
 	if err != nil {
 		return nil, err
@@ -130,6 +142,10 @@ func (fsys *Filesystem) Stat(name string) (fs.FileInfo, error) {
 // ReadLink returns the destination of the named symbolic link.
 // Experimental implementation of: https://github.com/golang/go/issues/49580
 func (fsys *Filesystem) ReadLink(name string) (string, error) {
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, true)
 	if err != nil {
 		return "", err
@@ -141,6 +157,10 @@ func (fsys *Filesystem) ReadLink(name string) (string, error) {
 }
 
 func (fsys *Filesystem) Lstat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	de, err := fsys.resolve(name, true)
 	if err != nil {
 		return nil, err
