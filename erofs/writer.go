@@ -600,7 +600,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 
 	compact := fi.Size() <= math.MaxUint32 &&
 		uid <= math.MaxUint16 && gid <= math.MaxUint16 &&
-		fi.ModTime().Equal(time.Time{})
+		fi.ModTime().IsZero()
 
 	if compact {
 		return InodeCompact{

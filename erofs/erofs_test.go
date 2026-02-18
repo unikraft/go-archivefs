@@ -513,6 +513,99 @@ func TestEROFSModTimeNanoseconds(t *testing.T) {
 	require.Equal(t, modTime.Nanosecond(), info.ModTime().Nanosecond())
 }
 
+func TestEROFSZeroModTimeCompactInode(t *testing.T) {
+	// Files with zero modtime should use compact inodes (32 bytes) rather
+	// than extended (64 bytes). The Go zero time time.Time{} has a nil
+	// Location, but some FS implementations return the equivalent zero
+	// time with a UTC Location (e.g. time.Time{}.UTC()). These are both
+	// IsZero() but not == time.Time{}. Previously the writer used == which
+	// would miss the UTC variant and produce an unnecessarily large inode.
+	srcFS := memfs.New()
+	require.NoError(t, srcFS.WriteFile("file.txt", []byte("hello"), 0o644))
+
+	// Wrap to override ModTime with the UTC-located zero time.
+	wrapped := &zeroUTCModTimeFS{FS: srcFS}
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "compact.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, wrapped))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	info, err := fsys.Stat("file.txt")
+	require.NoError(t, err)
+
+	ino := info.Sys().(*erofs.Inode)
+
+	// Layout 0 = compact (32 bytes), layout 1 = extended (64 bytes).
+	require.Equal(t, uint16(0), ino.Layout(), "zero-modtime file should use compact inode layout")
+}
+
+// zeroUTCModTimeFS wraps an fs.FS and overrides ModTime to return the zero
+// time with a non-nil UTC Location, which is IsZero() but != time.Time{}.
+type zeroUTCModTimeFS struct {
+	fs.FS
+}
+
+func (z *zeroUTCModTimeFS) Open(name string) (fs.File, error) {
+	f, err := z.FS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &zeroUTCModTimeFile{File: f}, nil
+}
+
+type zeroUTCModTimeFile struct {
+	fs.File
+}
+
+func (f *zeroUTCModTimeFile) Stat() (fs.FileInfo, error) {
+	info, err := f.File.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return &zeroUTCFileInfo{FileInfo: info}, nil
+}
+
+func (f *zeroUTCModTimeFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	rdf, ok := f.File.(fs.ReadDirFile)
+	if !ok {
+		return nil, fs.ErrInvalid
+	}
+	entries, err := rdf.ReadDir(n)
+	if err != nil {
+		return nil, err
+	}
+	wrapped := make([]fs.DirEntry, len(entries))
+	for i, e := range entries {
+		wrapped[i] = &zeroUTCDirEntry{DirEntry: e}
+	}
+	return wrapped, nil
+}
+
+type zeroUTCDirEntry struct {
+	fs.DirEntry
+}
+
+func (e *zeroUTCDirEntry) Info() (fs.FileInfo, error) {
+	info, err := e.DirEntry.Info()
+	if err != nil {
+		return nil, err
+	}
+	return &zeroUTCFileInfo{FileInfo: info}, nil
+}
+
+type zeroUTCFileInfo struct {
+	fs.FileInfo
+}
+
+func (fi *zeroUTCFileInfo) ModTime() time.Time {
+	return time.Time{}.UTC() // IsZero() == true, but != time.Time{}
+}
+
 // countingFS wraps an fs.FS and counts how many times each path is opened.
 type countingFS struct {
 	fs.FS
