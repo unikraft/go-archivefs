@@ -378,6 +378,59 @@ func TestEROFSSymlinkCycleDetection(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestEROFSStatLink(t *testing.T) {
+	// Build a tar with a symlink and its target.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "target.txt",
+		Size:     5,
+		Mode:     0o644,
+	}))
+	_, err := tw.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeSymlink,
+		Name:     "link",
+		Linkname: "target.txt",
+		Mode:     0o777,
+	}))
+	require.NoError(t, tw.Close())
+
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
+
+	imgFile, err := os.CreateTemp(t.TempDir(), "statlink-*.img")
+	require.NoError(t, err)
+	t.Cleanup(func() { imgFile.Close() })
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	// Stat follows the symlink, returning the target's info.
+	statFI, err := fsys.Stat("link")
+	require.NoError(t, err)
+	require.Equal(t, "target.txt", statFI.Name())
+	require.False(t, statFI.Mode()&fs.ModeSymlink != 0, "Stat should follow symlinks")
+
+	// StatLink does not follow the symlink.
+	linkFI, err := fsys.StatLink("link")
+	require.NoError(t, err)
+	require.Equal(t, "link", linkFI.Name())
+	require.True(t, linkFI.Mode()&fs.ModeSymlink != 0, "StatLink should not follow symlinks")
+
+	// Both should return a valid *erofs.Inode via Sys().
+	require.NotNil(t, statFI.Sys())
+	require.NotNil(t, linkFI.Sys())
+	_, ok := statFI.Sys().(*erofs.Inode)
+	require.True(t, ok, "Stat Sys() should return *erofs.Inode")
+	_, ok = linkFI.Sys().(*erofs.Inode)
+	require.True(t, ok, "StatLink Sys() should return *erofs.Inode")
+}
+
 func TestEROFSSuperBlockChecksum(t *testing.T) {
 	// Create a valid image.
 	srcFS := memfs.New()

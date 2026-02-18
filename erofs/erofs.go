@@ -148,6 +148,7 @@ func (fsys *Filesystem) Lstat(name string) (fs.FileInfo, error) {
 	ino := de.getInode()
 
 	return &fileInfo{
+		image: de.image,
 		name:  de.name,
 		inode: ino,
 	}, nil
