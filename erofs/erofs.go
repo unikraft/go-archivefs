@@ -274,9 +274,22 @@ func (de *dirEntry) IsDir() bool {
 }
 
 func (de *dirEntry) Type() fs.FileMode {
-	ino := de.getInode()
-
-	return ino.Mode().Type()
+	switch de.typ {
+	case FT_DIR:
+		return fs.ModeDir
+	case FT_SYMLINK:
+		return fs.ModeSymlink
+	case FT_CHRDEV:
+		return fs.ModeDevice | fs.ModeCharDevice
+	case FT_BLKDEV:
+		return fs.ModeDevice
+	case FT_FIFO:
+		return fs.ModeNamedPipe
+	case FT_SOCK:
+		return fs.ModeSocket
+	default:
+		return 0
+	}
 }
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
