@@ -150,6 +150,10 @@ func Open(ra io.ReaderAt) (*FS, error) {
 }
 
 func (fsys *FS) Open(name string) (fs.File, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, name)
 	if err != nil {
 		return nil, err
@@ -164,6 +168,10 @@ func (fsys *FS) Open(name string) (fs.File, error) {
 }
 
 func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, name)
 	if err != nil {
 		return nil, err
@@ -182,6 +190,10 @@ func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	if sanitizePath(name) == "" {
 		d := &dirent{
 			Header: tar.Header{
@@ -210,6 +222,10 @@ func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
 // Experimental implementation of fs.ReadLinkFS:
 // https://github.com/golang/go/issues/49580
 func (fsys *FS) ReadLink(name string) (string, error) {
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, filepath.Dir(name))
 	if err != nil {
 		return "", err
@@ -228,6 +244,10 @@ func (fsys *FS) ReadLink(name string) (string, error) {
 }
 
 func (fsys *FS) Lstat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, filepath.Dir(name))
 	if err != nil {
 		return nil, err
@@ -245,6 +265,10 @@ func (fsys *FS) Lstat(name string) (fs.FileInfo, error) {
 // Experimental implementation of fs.ReadLinkFS:
 // https://github.com/golang/go/issues/49580
 func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "statlink", Path: name, Err: fs.ErrInvalid}
+	}
+
 	d, err := resolve(&fsys.root, filepath.Dir(name))
 	if err != nil {
 		return nil, err

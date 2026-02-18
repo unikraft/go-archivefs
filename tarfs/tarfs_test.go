@@ -393,6 +393,11 @@ func TestTarFS(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, file := range v.files {
+				// Skip entries with names that are not valid fs.FS paths
+				// (e.g. non-UTF8 filenames, trailing slashes).
+				if !fs.ValidPath(file.Name) {
+					continue
+				}
 
 				var fi fs.FileInfo
 				var sum string
