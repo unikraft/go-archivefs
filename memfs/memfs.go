@@ -261,7 +261,8 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 		}
 	}
 
-	if name == "." {
+	isRoot := name == "."
+	if isRoot {
 		// root dir
 		name = ""
 	}
@@ -280,8 +281,13 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 		}
 		return handle, nil
 	case *dir:
+		dirName := cc.name
+		if isRoot {
+			dirName = "."
+		}
 		handle := &fhDir{
-			dir: cc,
+			dir:  cc,
+			name: dirName,
 		}
 		return handle, nil
 	}
@@ -307,13 +313,14 @@ type dir struct {
 }
 
 type fhDir struct {
-	dir *dir
-	idx int
+	dir  *dir
+	name string
+	idx  int
 }
 
 func (d *fhDir) Stat() (fs.FileInfo, error) {
 	fi := fileInfo{
-		name:    d.dir.name,
+		name:    d.name,
 		size:    4096,
 		modTime: d.dir.modTime,
 		mode:    d.dir.perm | fs.ModeDir,
