@@ -406,6 +406,27 @@ func TestEROFSSuperBlockChecksum(t *testing.T) {
 	require.Contains(t, err.Error(), "invalid checksum")
 }
 
+func TestEROFSRootNidSet(t *testing.T) {
+	// Verify the writer explicitly sets RootNid in the superblock.
+	srcFS := memfs.New()
+	require.NoError(t, srcFS.MkdirAll("subdir", 0o755))
+	require.NoError(t, srcFS.WriteFile("subdir/file.txt", []byte("data"), 0o644))
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "rootnid.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	img, err := erofs.OpenImage(imgFile)
+	require.NoError(t, err)
+
+	// The root inode must be reachable via the superblock's RootNid.
+	rootIno, err := img.Inode(img.RootNid())
+	require.NoError(t, err)
+	require.True(t, rootIno.IsDir(), "root inode must be a directory")
+}
+
 func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 	// Create a valid image with a file.
 	srcFS := memfs.New()

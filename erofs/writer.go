@@ -86,6 +86,20 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write data blocks: %w", err)
 	}
 
+	rootIno, ok := w.inodes["."]
+	if !ok {
+		return fmt.Errorf("root inode not found")
+	}
+	var rootNid uint16
+	switch ino := rootIno.(type) {
+	case InodeCompact:
+		rootNid = uint16(ino.Ino)
+	case InodeExtended:
+		rootNid = uint16(ino.Ino)
+	default:
+		return fmt.Errorf("unsupported root inode type %T", rootIno)
+	}
+
 	// Generate a UUID for the filesystem.
 	uuidBytes, err := uuid.New().MarshalBinary()
 	if err != nil {
@@ -98,8 +112,8 @@ func (w *writer) write() error {
 
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
-		FeatureCompat: FeatureCompatSuperBlockChecksum,
 		BlockSizeBits: BlockSizeBits,
+		RootNid:       rootNid,
 		Inodes:        uint64(len(w.inodes)),
 		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
