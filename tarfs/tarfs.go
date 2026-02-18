@@ -84,14 +84,14 @@ func Open(ra io.ReaderAt) (*FS, error) {
 
 		// Create a default directory entry for each parent directory.
 		for dir := filepath.Dir(h.Name); dir != "." && dir != "/"; dir = filepath.Dir(dir) {
-			// Create a default directory entry if it doesn't exist.
-			// Don't worry if we see one later, we'll just overwrite it.
-			dirents[dir] = &dirent{
-				Header: tar.Header{
-					Typeflag: tar.TypeDir,
-					Name:     dir,
-					Mode:     0o755,
-				},
+			if _, exists := dirents[dir]; !exists {
+				dirents[dir] = &dirent{
+					Header: tar.Header{
+						Typeflag: tar.TypeDir,
+						Name:     dir,
+						Mode:     0o755,
+					},
+				}
 			}
 		}
 
