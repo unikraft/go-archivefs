@@ -63,3 +63,61 @@ func TestInodeModeBlockDevice(t *testing.T) {
 		t.Errorf("block device Mode().Type() = %v, want ModeDevice", mode.Type())
 	}
 }
+
+func TestInodeModeSetuid(t *testing.T) {
+	ino := Inode{mode: S_IFREG | S_ISUID | 0o755}
+	mode := ino.Mode()
+
+	if mode&fs.ModeSetuid == 0 {
+		t.Error("Mode() missing ModeSetuid")
+	}
+	if mode.Perm() != 0o755 {
+		t.Errorf("Perm() = 0o%o, want 0o755", mode.Perm())
+	}
+}
+
+func TestInodeModeSetgid(t *testing.T) {
+	ino := Inode{mode: S_IFREG | S_ISGID | 0o755}
+	mode := ino.Mode()
+
+	if mode&fs.ModeSetgid == 0 {
+		t.Error("Mode() missing ModeSetgid")
+	}
+}
+
+func TestInodeModeSticky(t *testing.T) {
+	ino := Inode{mode: S_IFDIR | S_ISVTX | 0o755}
+	mode := ino.Mode()
+
+	if mode&fs.ModeSticky == 0 {
+		t.Error("Mode() missing ModeSticky")
+	}
+	if !mode.IsDir() {
+		t.Error("sticky dir Mode() missing ModeDir")
+	}
+}
+
+func TestStatModeRoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		mode fs.FileMode
+	}{
+		{"setuid", fs.ModeSetuid | 0o755},
+		{"setgid", fs.ModeSetgid | 0o755},
+		{"sticky dir", fs.ModeDir | fs.ModeSticky | 0o755},
+		{"setuid+setgid", fs.ModeSetuid | fs.ModeSetgid | 0o755},
+		{"all special bits dir", fs.ModeDir | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky | 0o755},
+		{"regular no special", 0o644},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stMode := statModeFromFileMode(tt.mode)
+			ino := Inode{mode: stMode}
+			got := ino.Mode()
+			if got != tt.mode {
+				t.Errorf("round-trip: statModeFromFileMode(0o%o) -> 0o%o -> Mode() = 0o%o, want 0o%o",
+					tt.mode, stMode, got, tt.mode)
+			}
+		})
+	}
+}
