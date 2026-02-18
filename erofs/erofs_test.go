@@ -289,6 +289,50 @@ func TestEROFSFilenamesSortingBeforeDot(t *testing.T) {
 	require.Equal(t, "normal.txt", info.Name())
 }
 
+func TestEROFSFilenamesSortingBeforeDotRoot(t *testing.T) {
+	// Same as above but with files at the root level, where only '.' exists
+	// (no '..' entry). Verifies the root directory case is also sorted correctly.
+	prefixes := []string{"!", "#", "-"}
+
+	srcFS := memfs.New()
+	for _, p := range prefixes {
+		name := p + "root.txt"
+		require.NoError(t, srcFS.WriteFile(name, []byte("root-"+p), 0o644))
+	}
+	require.NoError(t, srcFS.WriteFile("zebra.txt", []byte("zebra"), 0o644))
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "rootsort.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, imgFile.Close())
+	})
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	for _, p := range prefixes {
+		name := p + "root.txt"
+		t.Run(name, func(t *testing.T) {
+			info, err := fsys.Stat(name)
+			require.NoError(t, err)
+			require.Equal(t, name, info.Name())
+
+			f, err := fsys.Open(name)
+			require.NoError(t, err)
+			data, err := io.ReadAll(f)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			require.Equal(t, "root-"+p, string(data))
+		})
+	}
+
+	info, err := fsys.Stat("zebra.txt")
+	require.NoError(t, err)
+	require.Equal(t, "zebra.txt", info.Name())
+}
+
 func TestEROFSCreate(t *testing.T) {
 	srcFile, err := os.Open("testdata/toybox.img")
 	require.NoError(t, err)
