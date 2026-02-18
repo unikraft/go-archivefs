@@ -71,8 +71,7 @@ func (fsys *Filesystem) Open(name string) (fs.File, error) {
 	}
 
 	return &file{
-		image: fsys.image,
-		de:    de,
+		de: de,
 	}, nil
 }
 
@@ -209,9 +208,8 @@ func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, rem
 }
 
 type file struct {
-	image *Image
-	de    *dirEntry
-	r     io.Reader
+	de *dirEntry
+	r  io.Reader
 }
 
 func (f *file) Read(p []byte) (int, error) {
