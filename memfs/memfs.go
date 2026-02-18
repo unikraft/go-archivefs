@@ -44,6 +44,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	syspath "path"
@@ -339,6 +340,9 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 	slices.Sort(names)
 
 	remaining := len(names) - d.idx
+	if n > 0 && remaining == 0 {
+		return nil, io.EOF
+	}
 	if n <= 0 || n > remaining {
 		n = remaining
 	}
