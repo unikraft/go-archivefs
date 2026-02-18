@@ -27,6 +27,7 @@ var (
 	_ fs.FS                = (*FS)(nil)
 	_ fs.ReadDirFS         = (*FS)(nil)
 	_ fs.StatFS            = (*FS)(nil)
+	_ fs.ReadLinkFS        = (*FS)(nil)
 	_ archivefs.ReadLinkFS = (*FS)(nil)
 )
 
@@ -224,6 +225,20 @@ func (fsys *FS) ReadLink(name string) (string, error) {
 	}
 
 	return d.Linkname, nil
+}
+
+func (fsys *FS) Lstat(name string) (fs.FileInfo, error) {
+	d, err := resolve(&fsys.root, filepath.Dir(name))
+	if err != nil {
+		return nil, err
+	}
+
+	d, found := d.findChild(filepath.Base(name))
+	if !found {
+		return nil, fs.ErrNotExist
+	}
+
+	return d.Info()
 }
 
 // StatLink returns a FileInfo describing the file without following any symbolic links.

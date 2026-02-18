@@ -188,33 +188,30 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Ino = nid
 				ino.Size = uint32(size)
 			} else {
-				fsys, ok := w.src.(fs.ReadLinkFS)
-				if !ok {
-					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
-				}
+				ino.Ino = nid
+				ino.Size = uint32(size)
 
-				info, err := fsys.Lstat(path)
-				if err != nil {
-					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
-				}
-				fsIno := getIno(info)
-
-				if entry, ok := w.linkMap[fsIno]; ok {
-					if w.linkMap[fsIno].Count == 0 {
-						ino.Ino = nid
-						entry.Count = 1
-						entry.Inode = uint64(ino.Ino)
-					} else {
-						// If this is a hard link, we reuse the inode number from the first
-						// file with the same fsInode.
-						ino.Ino = uint32(w.linkMap[fsIno].Inode)
-						entry.Count = w.linkMap[fsIno].Count + 1
+				if fsys, ok := w.src.(fs.ReadLinkFS); ok {
+					info, err := fsys.Lstat(path)
+					if err != nil {
+						return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
 					}
-					ino.Size = uint32(size)
+					fsIno := getIno(info)
 
-					w.linkMap[fsIno] = entry
-				} else {
-					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+					if fsIno != 0 {
+						if entry, ok := w.linkMap[fsIno]; ok {
+							if w.linkMap[fsIno].Count == 0 {
+								entry.Count = 1
+								entry.Inode = uint64(ino.Ino)
+							} else {
+								ino.Ino = uint32(w.linkMap[fsIno].Inode)
+								entry.Count = w.linkMap[fsIno].Count + 1
+							}
+							w.linkMap[fsIno] = entry
+						} else {
+							return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+						}
+					}
 				}
 			}
 			if inlined {
@@ -230,33 +227,30 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Ino = nid
 				ino.Size = uint64(size)
 			} else {
-				fsys, ok := w.src.(fs.ReadLinkFS)
-				if !ok {
-					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
-				}
+				ino.Ino = nid
+				ino.Size = uint64(size)
 
-				info, err := fsys.Lstat(path)
-				if err != nil {
-					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
-				}
-				fsIno := getIno(info)
-
-				if entry, ok := w.linkMap[fsIno]; ok {
-					if w.linkMap[fsIno].Count == 0 {
-						ino.Ino = nid
-						entry.Count = 1
-						entry.Inode = uint64(ino.Ino)
-					} else {
-						// If this is a hard link, we reuse the inode number from the first
-						// file with the same fsInode.
-						ino.Ino = uint32(w.linkMap[fsIno].Inode)
-						entry.Count = w.linkMap[fsIno].Count + 1
+				if fsys, ok := w.src.(fs.ReadLinkFS); ok {
+					info, err := fsys.Lstat(path)
+					if err != nil {
+						return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
 					}
-					ino.Size = uint64(size)
+					fsIno := getIno(info)
 
-					w.linkMap[fsIno] = entry
-				} else {
-					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+					if fsIno != 0 {
+						if entry, ok := w.linkMap[fsIno]; ok {
+							if w.linkMap[fsIno].Count == 0 {
+								entry.Count = 1
+								entry.Inode = uint64(ino.Ino)
+							} else {
+								ino.Ino = uint32(w.linkMap[fsIno].Inode)
+								entry.Count = w.linkMap[fsIno].Count + 1
+							}
+							w.linkMap[fsIno] = entry
+						} else {
+							return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
+						}
+					}
 				}
 			}
 			if inlined {
