@@ -22,6 +22,9 @@ func getOwner(fi fs.FileInfo) (uid, gid int) {
 	case *tar.Header:
 		uid = sys.Uid
 		gid = sys.Gid
+	case *Inode:
+		uid = int(sys.UID())
+		gid = int(sys.GID())
 	}
 
 	return

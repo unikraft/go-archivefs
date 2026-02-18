@@ -765,6 +765,58 @@ func TestEROFSDirEntryTypeReturnsBits(t *testing.T) {
 	require.Equal(t, fs.FileMode(0), subEntries[0].Type(), "regular file should have zero type bits")
 }
 
+func TestEROFSRoundTripPreservesOwnership(t *testing.T) {
+	// Create a tar with a specific UID/GID.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "owned.txt",
+		Size:     3,
+		Mode:     0o644,
+		Uid:      1234,
+		Gid:      5678,
+	}))
+	_, err := tw.Write([]byte("hey"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
+
+	// Write first EROFS image from tarfs.
+	img1, err := os.CreateTemp(t.TempDir(), "owner1-*.img")
+	require.NoError(t, err)
+	t.Cleanup(func() { img1.Close() })
+
+	require.NoError(t, erofs.Create(img1, srcFS))
+
+	fsys1, err := erofs.Open(img1)
+	require.NoError(t, err)
+
+	fi1, err := fsys1.Stat("owned.txt")
+	require.NoError(t, err)
+	ino1 := fi1.Sys().(*erofs.Inode)
+	require.Equal(t, uint32(1234), ino1.UID())
+	require.Equal(t, uint32(5678), ino1.GID())
+
+	// Round-trip: write second EROFS image from the first.
+	img2, err := os.CreateTemp(t.TempDir(), "owner2-*.img")
+	require.NoError(t, err)
+	t.Cleanup(func() { img2.Close() })
+
+	require.NoError(t, erofs.Create(img2, fsys1))
+
+	fsys2, err := erofs.Open(img2)
+	require.NoError(t, err)
+
+	fi2, err := fsys2.Stat("owned.txt")
+	require.NoError(t, err)
+	ino2 := fi2.Sys().(*erofs.Inode)
+	require.Equal(t, uint32(1234), ino2.UID(), "UID should survive EROFS round-trip")
+	require.Equal(t, uint32(5678), ino2.GID(), "GID should survive EROFS round-trip")
+}
+
 func TestEROFSCreate(t *testing.T) {
 	srcFile, err := os.Open("testdata/toybox.img")
 	require.NoError(t, err)
