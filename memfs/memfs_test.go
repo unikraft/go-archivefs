@@ -43,6 +43,7 @@ package memfs_test
 import (
 	"fmt"
 	"io/fs"
+	"slices"
 	"testing"
 
 	"github.com/unikraft/go-archivefs/memfs"
@@ -105,4 +106,62 @@ func TestMemFS(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, body, gotBody)
+}
+
+func TestMemFSReadDirSorted(t *testing.T) {
+	rootFS := memfs.New()
+
+	// Create files in non-alphabetical order.
+	for _, name := range []string{"cherry.txt", "apple.txt", "banana.txt"} {
+		require.NoError(t, rootFS.WriteFile(name, []byte(name), 0o644))
+	}
+	require.NoError(t, rootFS.MkdirAll("delta", 0o755))
+
+	// fs.ReadDir must return entries sorted by name.
+	entries, err := fs.ReadDir(rootFS, ".")
+	require.NoError(t, err)
+
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+
+	require.True(t, slices.IsSorted(names), "ReadDir must return sorted entries, got: %v", names)
+	require.Equal(t, []string{"apple.txt", "banana.txt", "cherry.txt", "delta"}, names)
+}
+
+func TestMemFSReadDirPagination(t *testing.T) {
+	rootFS := memfs.New()
+
+	for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"} {
+		require.NoError(t, rootFS.WriteFile(name, []byte(name), 0o644))
+	}
+
+	f, err := rootFS.Open(".")
+	require.NoError(t, err)
+
+	dirFile, ok := f.(fs.ReadDirFile)
+	require.True(t, ok)
+
+	// Read first 2 entries.
+	batch1, err := dirFile.ReadDir(2)
+	require.NoError(t, err)
+	require.Len(t, batch1, 2)
+	require.Equal(t, "a.txt", batch1[0].Name())
+	require.Equal(t, "b.txt", batch1[1].Name())
+
+	// Read next 2 entries.
+	batch2, err := dirFile.ReadDir(2)
+	require.NoError(t, err)
+	require.Len(t, batch2, 2)
+	require.Equal(t, "c.txt", batch2[0].Name())
+	require.Equal(t, "d.txt", batch2[1].Name())
+
+	// Read remaining - should get 1 entry.
+	batch3, err := dirFile.ReadDir(2)
+	require.NoError(t, err)
+	require.Len(t, batch3, 1)
+	require.Equal(t, "e.txt", batch3[0].Name())
+
+	require.NoError(t, f.Close())
 }

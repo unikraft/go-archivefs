@@ -47,6 +47,7 @@ import (
 	"io/fs"
 	"os"
 	syspath "path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -335,15 +336,15 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 	for name := range d.dir.children {
 		names = append(names, name)
 	}
+	slices.Sort(names)
 
-	if n <= 0 {
-		n = len(names)
+	remaining := len(names) - d.idx
+	if n <= 0 || n > remaining {
+		n = remaining
 	}
 
 	out := make([]fs.DirEntry, 0, n)
-
-	for i := d.idx; i < n && i < len(names); i++ {
-		name := names[i]
+	for _, name := range names[d.idx : d.idx+n] {
 		child := d.dir.children[name]
 
 		f, isFile := child.(*File)
@@ -353,20 +354,19 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 				info: stat,
 			})
 		} else {
-			d := child.(*dir)
+			cd := child.(*dir)
 			fi := fileInfo{
-				name:    d.name,
+				name:    cd.name,
 				size:    4096,
-				modTime: d.modTime,
-				mode:    d.perm | fs.ModeDir,
+				modTime: cd.modTime,
+				mode:    cd.perm | fs.ModeDir,
 			}
 			out = append(out, &dirEntry{
 				info: &fi,
 			})
 		}
-
-		d.idx = i
 	}
+	d.idx += n
 	return out, nil
 }
 
