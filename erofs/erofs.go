@@ -74,6 +74,14 @@ func (fsys *Filesystem) Open(name string) (fs.File, error) {
 		return nil, err
 	}
 
+	if de.IsDir() {
+		return &dirFile{
+			fsys: fsys,
+			de:   de,
+			name: name,
+		}, nil
+	}
+
 	return &file{
 		de: de,
 	}, nil
@@ -240,6 +248,56 @@ func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, rem
 		de = child
 	}
 	return de, nil
+}
+
+type dirFile struct {
+	fsys    *Filesystem
+	de      *dirEntry
+	name    string
+	entries []fs.DirEntry
+	offset  int
+}
+
+func (f *dirFile) Stat() (fs.FileInfo, error) {
+	return f.de.Info()
+}
+
+func (f *dirFile) Read([]byte) (int, error) {
+	return 0, &fs.PathError{Op: "read", Path: f.name, Err: errors.New("is a directory")}
+}
+
+func (f *dirFile) Close() error {
+	return nil
+}
+
+func (f *dirFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	if f.entries == nil {
+		entries, err := f.fsys.ReadDir(f.name)
+		if err != nil {
+			return nil, err
+		}
+		f.entries = entries
+	}
+
+	if n <= 0 {
+		entries := f.entries[f.offset:]
+		f.offset = len(f.entries)
+		return entries, nil
+	}
+
+	remaining := len(f.entries) - f.offset
+	if remaining == 0 {
+		return nil, io.EOF
+	}
+	if n > remaining {
+		n = remaining
+	}
+	entries := f.entries[f.offset : f.offset+n]
+	f.offset += n
+	if f.offset >= len(f.entries) {
+		return entries, io.EOF
+	}
+	return entries, nil
 }
 
 type file struct {
