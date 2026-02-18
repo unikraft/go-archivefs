@@ -90,7 +90,7 @@ func (fsys *Filesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 	}
 
 	if !de.IsDir() {
-		return nil, errors.New("not a directory")
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: errors.New("not a directory")}
 	}
 
 	ino := de.getInode()
