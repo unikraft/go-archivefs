@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/unikraft/go-archivefs/erofs"
@@ -468,6 +469,56 @@ func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 	_, _ = fsys.Stat("file.txt")
 	_, _ = fsys.Open("file.txt")
 	_, _ = fsys.ReadDir(".")
+}
+
+// countingFS wraps an fs.FS and counts how many times each path is opened.
+type countingFS struct {
+	fs.FS
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (c *countingFS) Open(name string) (fs.File, error) {
+	c.mu.Lock()
+	c.counts[name]++
+	c.mu.Unlock()
+	return c.FS.Open(name)
+}
+
+func TestEROFSFileOpenedOnce(t *testing.T) {
+	// Verify that regular files are only opened once during Create,
+	// not twice (firstPass used to open files just to get their size).
+	srcFS := memfs.New()
+	require.NoError(t, srcFS.MkdirAll("dir", 0o755))
+	require.NoError(t, srcFS.WriteFile("dir/a.txt", []byte("aaa"), 0o644))
+	require.NoError(t, srcFS.WriteFile("dir/b.txt", []byte("bbb"), 0o644))
+	require.NoError(t, srcFS.WriteFile("big.txt", make([]byte, 8192), 0o644))
+
+	cfs := &countingFS{FS: srcFS, counts: make(map[string]int)}
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "counting.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, cfs))
+
+	// Each regular file should be opened exactly once (in the write phase).
+	// Before the fix, firstPass would also open each file to get its size.
+	for _, name := range []string{"dir/a.txt", "dir/b.txt", "big.txt"} {
+		require.Equal(t, 1, cfs.counts[name], "file %q should be opened exactly once", name)
+	}
+
+	// Verify the image is still correct.
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	data, err := fs.ReadFile(fsys, "dir/a.txt")
+	require.NoError(t, err)
+	require.Equal(t, []byte("aaa"), data)
+
+	data, err = fs.ReadFile(fsys, "big.txt")
+	require.NoError(t, err)
+	require.Len(t, data, 8192)
 }
 
 func TestEROFSCreate(t *testing.T) {
