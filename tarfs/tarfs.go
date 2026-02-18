@@ -158,6 +158,10 @@ func (fsys *FS) Open(name string) (fs.File, error) {
 		return nil, err
 	}
 
+	if d.IsDir() {
+		return &dirFile{dirent: d}, nil
+	}
+
 	tr := tar.NewReader(d.data())
 	if _, err := tr.Next(); err != nil {
 		return nil, fmt.Errorf("failed to read file %s: %w", name, err)
@@ -350,6 +354,56 @@ func sanitizePath(name string) string {
 	}
 
 	return cleaned
+}
+
+type dirFile struct {
+	*dirent
+	entries []fs.DirEntry
+	offset  int
+}
+
+func (f *dirFile) Stat() (fs.FileInfo, error) {
+	return f.Info()
+}
+
+func (f *dirFile) Read([]byte) (int, error) {
+	return 0, &fs.PathError{Op: "read", Path: f.Name(), Err: errors.New("is a directory")}
+}
+
+func (f *dirFile) Close() error {
+	return nil
+}
+
+func (f *dirFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	if f.entries == nil {
+		f.entries = make([]fs.DirEntry, 0, len(f.children))
+		for _, child := range f.children {
+			f.entries = append(f.entries, child)
+		}
+		slices.SortFunc(f.entries, func(a, b fs.DirEntry) int {
+			return strings.Compare(a.Name(), b.Name())
+		})
+	}
+
+	if n <= 0 {
+		entries := f.entries[f.offset:]
+		f.offset = len(f.entries)
+		return entries, nil
+	}
+
+	remaining := len(f.entries) - f.offset
+	if remaining == 0 {
+		return nil, io.EOF
+	}
+	if n > remaining {
+		n = remaining
+	}
+	entries := f.entries[f.offset : f.offset+n]
+	f.offset += n
+	if f.offset >= len(f.entries) {
+		return entries, io.EOF
+	}
+	return entries, nil
 }
 
 type file struct {
