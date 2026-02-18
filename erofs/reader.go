@@ -79,10 +79,7 @@ const (
 )
 
 // Features w/ backward compatibility.
-// This is not exhaustive, unused features are not listed.
-const (
-	FeatureCompatSuperBlockChecksum = 0x00000001
-)
+// Constants defined in constants.go (EROFS_FEATURE_COMPAT_*).
 
 // Features w/o backward compatibility.
 //
@@ -241,7 +238,7 @@ func (i *Image) initSuperBlock() error {
 
 // verifyChecksum verifies the checksum of the superblock.
 func (i *Image) verifyChecksum() error {
-	if i.sb.FeatureCompat&FeatureCompatSuperBlockChecksum == 0 {
+	if i.sb.FeatureCompat&EROFS_FEATURE_COMPAT_SB_CHKSUM == 0 {
 		return nil
 	}
 
