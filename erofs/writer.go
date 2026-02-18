@@ -18,7 +18,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -497,22 +496,12 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 			names = append(names, de.Name())
 		}
 
-		// Sort the directory entries by name.
-		type pair struct {
-			d  Dirent
-			nm string
-		}
-		pairs := make([]pair, len(names))
-		for i := range names {
-			pairs[i] = pair{d: dirents[i], nm: names[i]}
-		}
-		sort.Slice(pairs, func(i, j int) bool {
-			return pairs[i].nm < pairs[j].nm
-		})
-		for i := range pairs {
-			dirents[i] = pairs[i].d
-			names[i] = pairs[i].nm
-		}
+		// EROFS requires directory entries in strict alphabetical order
+		// for binary search lookup. Sort all entries (including . and ..)
+		// by name. Previously . and .. were hardcoded at the front, which
+		// broke lookup for filenames starting with characters before '.'
+		// in ASCII (e.g. '#' = 0x23 < '.' = 0x2E).
+		sortDirents(dirents, names)
 
 		buf, err := encodeDirents(dirents, names)
 		if err != nil {
@@ -718,4 +707,15 @@ func roundUp(x, align int64) int64 {
 	}
 
 	return (x + align - 1) &^ (align - 1)
+}
+
+// sortDirents sorts dirents and names together by name, so that directory
+// entries are in strict alphabetical order as required by EROFS.
+func sortDirents(dirents []Dirent, names []string) {
+	for i := 1; i < len(dirents); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			dirents[j], dirents[j-1] = dirents[j-1], dirents[j]
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
 }

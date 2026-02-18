@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/unikraft/go-archivefs/erofs"
+	"github.com/unikraft/go-archivefs/memfs"
 	"github.com/rogpeppe/go-internal/dirhash"
 
 	"github.com/stretchr/testify/require"
@@ -233,6 +234,59 @@ func TestEROFS(t *testing.T) {
 
 		require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
 	})
+}
+
+func TestEROFSFilenamesSortingBeforeDot(t *testing.T) {
+	// EROFS requires directory entries in strict alphabetical order for
+	// binary search lookup. The '.' and '..' entries must be sorted among
+	// all other entries, not hardcoded at the front. All printable ASCII
+	// characters before '.' (0x2E) would be affected:
+	//   ! " # $ % & ' ( ) * + , -
+	// (0x21 through 0x2D)
+	prefixes := []string{"!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-"}
+
+	srcFS := memfs.New()
+	require.NoError(t, srcFS.MkdirAll("dir", 0o755))
+
+	for _, p := range prefixes {
+		name := p + "file.txt"
+		require.NoError(t, srcFS.WriteFile(filepath.Join("dir", name), []byte("content-"+p), 0o644))
+	}
+	// Also add a file that sorts after '.' for good measure.
+	require.NoError(t, srcFS.WriteFile("dir/normal.txt", []byte("normal"), 0o644))
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "sort.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, imgFile.Close())
+	})
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	// Stat (which uses Lookup/binary search) must find every file.
+	for _, p := range prefixes {
+		name := p + "file.txt"
+		t.Run(name, func(t *testing.T) {
+			info, err := fsys.Stat(filepath.Join("dir", name))
+			require.NoError(t, err)
+			require.Equal(t, name, info.Name())
+
+			f, err := fsys.Open(filepath.Join("dir", name))
+			require.NoError(t, err)
+			data, err := io.ReadAll(f)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			require.Equal(t, "content-"+p, string(data))
+		})
+	}
+
+	// Normal file should still work too.
+	info, err := fsys.Stat("dir/normal.txt")
+	require.NoError(t, err)
+	require.Equal(t, "normal.txt", info.Name())
 }
 
 func TestEROFSCreate(t *testing.T) {
