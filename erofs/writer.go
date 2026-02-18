@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	stdpath "path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -562,7 +563,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		// Add information about the parent directory.
 		if path != "." {
-			parentNid, err := w.findInodeAtPath(filepath.Join(path, ".."))
+			parentNid, err := w.findInodeAtPath(stdpath.Join(path, ".."))
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 			}
@@ -580,10 +581,10 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		names = append(names, "..")
 
 		for _, de := range entries {
-			path := filepath.Clean(filepath.Join(path, de.Name()))
-			nid, err := w.findInodeAtPath(path)
+			childPath := stdpath.Join(path, de.Name())
+			nid, err := w.findInodeAtPath(childPath)
 			if err != nil {
-				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
+				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", childPath, err)
 			}
 
 			dirents = append(dirents, Dirent{
@@ -628,7 +629,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 }
 
 func (w *writer) findInodeAtPath(path string) (uint64, error) {
-	cleanPath := filepath.Clean(path)
+	cleanPath := stdpath.Clean(path)
 
 	ino, ok := w.inodes[cleanPath]
 	if !ok {
