@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/unikraft/go-archivefs/erofs"
 	"github.com/unikraft/go-archivefs/memfs"
@@ -469,6 +470,47 @@ func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 	_, _ = fsys.Stat("file.txt")
 	_, _ = fsys.Open("file.txt")
 	_, _ = fsys.ReadDir(".")
+}
+
+func TestEROFSModTimeNanoseconds(t *testing.T) {
+	// Extended inodes store nanosecond-precision modification times.
+	// Verify that ModTime() includes the nanosecond component.
+	modTime := time.Date(2024, 6, 15, 12, 30, 45, 123456789, time.UTC)
+
+	// Use PAX format explicitly to preserve nanosecond precision in tar.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	content := []byte("hello")
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Format:   tar.FormatPAX,
+		Name:     "file.txt",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(content)),
+		ModTime:  modTime,
+	}))
+	_, err := tw.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "nsec.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	info, err := fsys.Stat("file.txt")
+	require.NoError(t, err)
+
+	// The nanosecond component should be preserved.
+	require.Equal(t, modTime.Unix(), info.ModTime().Unix())
+	require.Equal(t, modTime.Nanosecond(), info.ModTime().Nanosecond())
 }
 
 // countingFS wraps an fs.FS and counts how many times each path is opened.

@@ -321,7 +321,7 @@ func (fi *fileInfo) Mode() fs.FileMode {
 }
 
 func (fi *fileInfo) ModTime() time.Time {
-	return time.Unix(int64(fi.inode.Mtime()), 0)
+	return time.Unix(int64(fi.inode.Mtime()), int64(fi.inode.MtimeNsec()))
 }
 
 func (fi *fileInfo) IsDir() bool {
