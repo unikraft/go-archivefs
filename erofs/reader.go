@@ -255,7 +255,7 @@ func (i *Image) verifyChecksum() error {
 
 	off := SuperBlockOffset + int64(binary.Size(i.sb))
 	if buf, err := i.bytesAt(off, int64(i.BlockSize())-off); err != nil {
-		return errors.New("image size is too small")
+		return fmt.Errorf("failed to read checksum block: %w", err)
 	} else {
 		checksum = ^crc32.Update(checksum, table, buf)
 	}
