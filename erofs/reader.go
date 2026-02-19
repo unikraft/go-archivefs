@@ -72,6 +72,9 @@ const (
 const (
 	InodeDataLayoutFlatPlain = iota
 	InodeDataLayoutFlatCompressionLegacy
+	// FlatInline is used for:
+	// 1. Fully inline files (size <= MaxInlineDataSize): all data inline, including empty files
+	// 2. Tail-packed files (size > MaxInlineDataSize): full blocks in data area + tail inline
 	InodeDataLayoutFlatInline
 	InodeDataLayoutFlatCompression
 	InodeDataLayoutChunkBased
@@ -266,33 +269,6 @@ func (i *Image) verifyChecksum() error {
 	return nil
 }
 
-// checksum populates the checksum of the superblock, it assumes the remainder
-// of the block contains all zeroes.
-func (sb *SuperBlock) checksum() error {
-	sbCopy := *sb
-	sbCopy.Checksum = 0
-
-	// Marshal the superblock into a byte buffer.
-	var marshalled bytes.Buffer
-	if err := binary.Write(&marshalled, binary.LittleEndian, sbCopy); err != nil {
-		return err
-	}
-
-	// Create a CRC32C table and calculate the checksum over the marshalled superblock.
-	table := crc32.MakeTable(crc32.Castagnoli)
-	checksum := crc32.Checksum(marshalled.Bytes(), table)
-
-	// Calculate the remaining bytes in the block after the superblock
-	// (assume all zeroes for now).
-	off := SuperBlockOffset + int64(binary.Size(sb))
-	remainingBytes := make([]byte, BlockSize-off)
-	checksum = ^crc32.Update(checksum, table, remainingBytes)
-
-	sb.Checksum = checksum
-
-	return nil
-}
-
 // inodeFormatAt returns the format of the inode at offset off within the
 // image.
 func (i *Image) inodeFormatAt(off int64) (uint16, error) {
@@ -421,7 +397,7 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 		// Like Linux, the inline data follows the inode and its xattrs, and must end in the block where it starts.
 		tailSize := int64(inode.size) & (blockSize - 1)
 		idataOff := off + inodeSize + xattrSize
-		if tailSize == 0 || idataOff&(blockSize-1)+tailSize > blockSize {
+		if inode.size > 0 && tailSize == 0 || idataOff&(blockSize-1)+tailSize > blockSize {
 			return Inode{}, fmt.Errorf("inline data not found or cross block boundary at inode %d, tail size: %d",
 				nid, tailSize)
 		}
