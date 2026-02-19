@@ -72,6 +72,9 @@ const (
 const (
 	InodeDataLayoutFlatPlain = iota
 	InodeDataLayoutFlatCompressionLegacy
+	// FlatInline is used for:
+	// 1. Fully inline files (size <= MaxInlineDataSize): all data inline, including empty files
+	// 2. Tail-packed files (size > MaxInlineDataSize): full blocks in data area + tail inline
 	InodeDataLayoutFlatInline
 	InodeDataLayoutFlatCompression
 	InodeDataLayoutChunkBased
@@ -269,33 +272,6 @@ func (i *Image) verifyChecksum() error {
 	return nil
 }
 
-// checksum populates the checksum of the superblock, it assumes the remainder
-// of the block contains all zeroes.
-func (sb *SuperBlock) checksum() error {
-	sbCopy := *sb
-	sbCopy.Checksum = 0
-
-	// Marshal the superblock into a byte buffer.
-	var marshalled bytes.Buffer
-	if err := binary.Write(&marshalled, binary.LittleEndian, sbCopy); err != nil {
-		return err
-	}
-
-	// Create a CRC32C table and calculate the checksum over the marshalled superblock.
-	table := crc32.MakeTable(crc32.Castagnoli)
-	checksum := crc32.Checksum(marshalled.Bytes(), table)
-
-	// Calculate the remaining bytes in the block after the superblock
-	// (assume all zeroes for now).
-	off := SuperBlockOffset + int64(binary.Size(sb))
-	remainingBytes := make([]byte, BlockSize-off)
-	checksum = ^crc32.Update(checksum, table, remainingBytes)
-
-	sb.Checksum = checksum
-
-	return nil
-}
-
 // inodeFormatAt returns the format of the inode at offset off within the
 // image.
 func (i *Image) inodeFormatAt(off int64) (uint16, error) {
@@ -423,14 +399,23 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 
 	switch dataLayout := inode.DataLayout(); dataLayout {
 	case InodeDataLayoutFlatInline:
-		// Check that whether the file data in the last block fits into
-		// the remaining room of the metadata block.
 		tailSize := int64(inode.size) & (blockSize - 1)
-		if tailSize == 0 || tailSize > blockSize-inodeSize {
-			return Inode{}, fmt.Errorf("inline data not found or cross block boundary at inode %d, tail size: %d",
+
+		// For fully inline files, tailSize could be 0 (empty files) or the entire file size
+		if inode.size > 0 && tailSize == 0 {
+			return Inode{}, fmt.Errorf("non-empty file with no tail using flat inline at inode %d, size: %d",
+				nid, inode.size)
+		}
+
+		// For tail-packing, we need a non-zero tail that fits in the metadata block
+		if tailSize > blockSize-inodeSize {
+			return Inode{}, fmt.Errorf("inline data would cross block boundary at inode %d, tail size: %d",
 				nid, tailSize)
 		}
-		inode.idataOff = off + inodeSize
+
+		if inode.size > 0 {
+			inode.idataOff = off + inodeSize
+		}
 		fallthrough
 
 	case InodeDataLayoutFlatPlain:
