@@ -35,6 +35,12 @@ import (
 	"time"
 )
 
+const (
+	// maxSymlinkDepth is the maximum number of symlinks that can be followed
+	// during path resolution. This prevents infinite loops from symlink cycles.
+	maxSymlinkDepth = 40
+)
+
 var (
 	_ fs.FS         = (*Filesystem)(nil)
 	_ fs.ReadDirFS  = (*Filesystem)(nil)
@@ -160,6 +166,14 @@ func (fsys *Filesystem) StatLink(name string) (fs.FileInfo, error) {
 }
 
 func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEntry, error) {
+	return fsys.resolveWithDepth(name, noResolveLastSymlink, 0)
+}
+
+func (fsys *Filesystem) resolveWithDepth(name string, noResolveLastSymlink bool, depth int) (*dirEntry, error) {
+	if depth > maxSymlinkDepth {
+		return nil, errors.New("too many levels of symbolic links")
+	}
+
 	de := fsys.root
 
 	components := splitPath(name)
@@ -178,13 +192,13 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 			}
 			link = filepath.Clean(link)
 
-			if strings.HasPrefix(link, "/") {
-				link = strings.TrimPrefix(link, "/")
+			if after, ok := strings.CutPrefix(link, "/"); ok {
+				link = after
 			} else {
 				link = filepath.Join(strings.Join(components[:i], "/"), link)
 			}
 
-			child, err = fsys.resolve(link, noResolveLastSymlink)
+			child, err = fsys.resolveWithDepth(link, noResolveLastSymlink, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -192,6 +206,7 @@ func (fsys *Filesystem) resolve(name string, noResolveLastSymlink bool) (*dirEnt
 
 		de = child
 	}
+
 	return de, nil
 }
 
