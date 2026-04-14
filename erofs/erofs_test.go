@@ -18,8 +18,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/unikraft/go-archivefs/erofs"
 	"github.com/rogpeppe/go-internal/dirhash"
+	"github.com/unikraft/go-archivefs/erofs"
 
 	"github.com/stretchr/testify/require"
 )
@@ -277,4 +277,104 @@ func TestEROFSCreate(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
+}
+
+// TestEROFSHardlinkDeduplication tests that hardlinks are properly deduplicated
+// in the EROFS filesystem, ensuring that the same file data is only stored once.
+// This is a regression test for a bug where hardlinks would cause the same data
+// to be written multiple times, bloating the filesystem size.
+func TestEROFSHardlinkDeduplication(t *testing.T) {
+	// Create a temporary directory with hardlinks
+	srcDir := t.TempDir()
+
+	// Create a file with known content (1MB to make the size difference obvious)
+	largeContent := make([]byte, 1024*1024)
+	for i := range largeContent {
+		largeContent[i] = byte(i % 256)
+	}
+
+	originalFile := filepath.Join(srcDir, "original")
+	require.NoError(t, os.WriteFile(originalFile, largeContent, 0o644))
+
+	// Create multiple hardlinks to the same file
+	numHardlinks := 10
+	for i := range numHardlinks {
+		linkPath := filepath.Join(srcDir, filepath.Join("link", string(rune('a'+i))))
+		require.NoError(t, os.MkdirAll(filepath.Dir(linkPath), 0o755))
+		require.NoError(t, os.Link(originalFile, linkPath))
+	}
+
+	// Verify hardlinks were created correctly
+	originalStat, err := os.Stat(originalFile)
+	require.NoError(t, err)
+
+	for i := range numHardlinks {
+		linkPath := filepath.Join(srcDir, filepath.Join("link", string(rune('a'+i))))
+		linkStat, err := os.Stat(linkPath)
+		require.NoError(t, err)
+
+		// Verify they have the same inode (Unix-specific)
+		require.Equal(t, originalStat.Sys(), linkStat.Sys(), "hardlinks should share the same inode")
+	}
+
+	// Create EROFS filesystem from the directory
+	dstFile, err := os.OpenFile(filepath.Join(t.TempDir(), "hardlinks.erofs"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, dstFile.Close())
+	})
+
+	require.NoError(t, erofs.Create(dstFile, os.DirFS(srcDir), erofs.WithAllRoot(true)))
+
+	// Get the size of the EROFS filesystem
+	stat, err := dstFile.Stat()
+	require.NoError(t, err)
+	erofsSize := stat.Size()
+
+	// The EROFS filesystem should be much smaller than if each hardlink stored a copy
+	// Expected size: ~1MB (for one copy of the data) + metadata overhead
+	// Without deduplication: ~11MB (11 copies of the 1MB file) + metadata
+
+	// Allow some overhead for metadata, but the size should be closer to 1MB than 11MB
+	// We'll use 2MB as the upper bound to allow for metadata and block alignment
+	maxExpectedSize := int64(2 * 1024 * 1024)
+
+	// Without deduplication, it would be at least 10MB
+	minBuggySize := int64(10 * 1024 * 1024)
+
+	t.Logf("EROFS filesystem size: %d bytes (%.2f MB)", erofsSize, float64(erofsSize)/(1024*1024))
+
+	require.Less(t, erofsSize, maxExpectedSize,
+		"EROFS size should be close to single file size, not total of all hardlinks")
+	require.Greater(t, erofsSize, int64(0),
+		"EROFS size should be non-zero")
+
+	// If this fails, the hardlink deduplication is not working
+	if erofsSize > minBuggySize {
+		t.Fatalf("EROFS size (%d bytes) suggests hardlinks are not deduplicated (would be >%d bytes without fix)",
+			erofsSize, minBuggySize)
+	}
+
+	// Verify the filesystem is valid and readable
+	fsys, err := erofs.Open(dstFile)
+	require.NoError(t, err)
+
+	// Verify we can read the original file
+	f, err := fsys.Open("original")
+	require.NoError(t, err)
+	content, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.Equal(t, largeContent, content, "original file content should match")
+
+	// Verify all hardlinks are readable and have the same content
+	for i := range numHardlinks {
+		linkPath := filepath.Join("link", string(rune('a'+i)))
+		f, err := fsys.Open(linkPath)
+		require.NoError(t, err)
+		content, err := io.ReadAll(f)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		require.Equal(t, largeContent, content, "hardlink %s content should match original", linkPath)
+	}
 }

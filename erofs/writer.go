@@ -60,8 +60,9 @@ type writer struct {
 }
 
 type inodeCount struct {
-	Count int
-	Inode uint64
+	Count        int
+	Inode        uint64
+	RawBlockAddr uint32 // The block address for the first occurrence of this hardlink
 }
 
 func (w *writer) write() error {
@@ -157,12 +158,18 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			return metaSize, dataSize, fmt.Errorf("failed to convert offset to inode number: %w", err)
 		}
 
+		// Track if this is the first occurrence of a hardlinked file
+		shouldAllocate := false
+		rawBlockAssigned := false
+
 		switch ino := ino.(type) {
 		case InodeCompact:
 			if ino.Mode&S_IFMT == S_IFDIR {
 				ino.Ino = nid
 				ino.Size = uint32(size)
+				shouldAllocate = true
 			} else {
+				// Handle all non-directory files with hardlink deduplication
 				fsys, ok := w.src.(fs.ReadLinkFS)
 				if !ok {
 					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
@@ -175,17 +182,21 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				fsIno := getIno(info)
 
 				if entry, ok := w.linkMap[fsIno]; ok {
-					if w.linkMap[fsIno].Count == 0 {
+					if entry.Count == 0 {
 						ino.Ino = nid
 						entry.Count = 1
 						entry.Inode = uint64(ino.Ino)
+						entry.RawBlockAddr = uint32(dataSize / BlockSize)
+						shouldAllocate = true
 					} else {
-						// If this is a hard link, we reuse the inode number from the first
+						// If this is a hard link, we reuse the inode number and block address from the first
 						// file with the same fsInode.
-						ino.Ino = uint32(w.linkMap[fsIno].Inode)
-						entry.Count = w.linkMap[fsIno].Count + 1
+						ino.Ino = uint32(entry.Inode)
+						entry.Count += 1
 					}
 					ino.Size = uint32(size)
+					ino.RawBlockAddr = entry.RawBlockAddr
+					rawBlockAssigned = true
 
 					w.linkMap[fsIno] = entry
 				} else {
@@ -196,7 +207,10 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Format = setBits(ino.Format, InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits)
 			} else {
 				ino.Format = setBits(ino.Format, InodeDataLayoutFlatPlain, InodeDataLayoutBit, InodeDataLayoutBits)
-				ino.RawBlockAddr = uint32(dataSize / BlockSize)
+				// Assign a block address when hardlink logic didn't set one (directories).
+				if !rawBlockAssigned {
+					ino.RawBlockAddr = uint32(dataSize / BlockSize)
+				}
 			}
 			w.inodes[path] = ino
 
@@ -204,7 +218,9 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			if ino.Mode&S_IFMT == S_IFDIR {
 				ino.Ino = nid
 				ino.Size = uint64(size)
+				shouldAllocate = true
 			} else {
+				// Handle all non-directory files with hardlink deduplication
 				fsys, ok := w.src.(fs.ReadLinkFS)
 				if !ok {
 					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
@@ -217,17 +233,21 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				fsIno := getIno(info)
 
 				if entry, ok := w.linkMap[fsIno]; ok {
-					if w.linkMap[fsIno].Count == 0 {
+					if entry.Count == 0 {
 						ino.Ino = nid
 						entry.Count = 1
 						entry.Inode = uint64(ino.Ino)
+						entry.RawBlockAddr = uint32(dataSize / BlockSize)
+						shouldAllocate = true
 					} else {
-						// If this is a hard link, we reuse the inode number from the first
+						// If this is a hard link, we reuse the inode number and block address from the first
 						// file with the same fsInode.
-						ino.Ino = uint32(w.linkMap[fsIno].Inode)
-						entry.Count = w.linkMap[fsIno].Count + 1
+						ino.Ino = uint32(entry.Inode)
+						entry.Count += 1
 					}
 					ino.Size = uint64(size)
+					ino.RawBlockAddr = entry.RawBlockAddr
+					rawBlockAssigned = true
 
 					w.linkMap[fsIno] = entry
 				} else {
@@ -238,7 +258,10 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Format = setBits(ino.Format, InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits)
 			} else {
 				ino.Format = setBits(ino.Format, InodeDataLayoutFlatPlain, InodeDataLayoutBit, InodeDataLayoutBits)
-				ino.RawBlockAddr = uint32(dataSize / BlockSize)
+				// Assign a block address when hardlink logic didn't set one (directories).
+				if !rawBlockAssigned {
+					ino.RawBlockAddr = uint32(dataSize / BlockSize)
+				}
 			}
 			w.inodes[path] = ino
 
@@ -251,7 +274,9 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 		if inlined {
 			metaSize += size
 			metaSize = roundUp(metaSize, InodeSlotSize)
-		} else {
+		} else if shouldAllocate {
+			// Only allocate data space for the first occurrence of each
+			// hardlinked file, and every directory.
 			dataSize += size
 			dataSize = roundUp(dataSize, BlockSize)
 		}
@@ -327,6 +352,10 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 }
 
 func (w *writer) writeData() error {
+	// Track which inodes have already had data written (for hardlink deduplication)
+	// Only track regular files, as directories are unique per inode.
+	writtenInodes := make(map[uint32]bool)
+
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
@@ -336,13 +365,24 @@ func (w *writer) writeData() error {
 		}
 
 		var rawBlockAddr uint32
+		var mode uint16
+		var nid uint32
 		switch ino := ino.(type) {
 		case InodeCompact:
 			rawBlockAddr = ino.RawBlockAddr
+			mode = ino.Mode
+			nid = ino.Ino
 		case InodeExtended:
 			rawBlockAddr = ino.RawBlockAddr
+			mode = ino.Mode
+			nid = ino.Ino
 		default:
 			return fmt.Errorf("unsupported inode type %T", ino)
+		}
+
+		// Skip if we've already written data for this inode (hardlink case)
+		if mode&S_IFMT == S_IFREG && writtenInodes[nid] {
+			continue
 		}
 
 		data, _, err := w.dataForInode(path, ino)
@@ -354,6 +394,11 @@ func (w *writer) writeData() error {
 		_ = data.Close()
 		if err != nil {
 			return fmt.Errorf("failed to write data for %q: %w", path, err)
+		}
+
+		// Mark this inode's data as written (only for regular files)
+		if mode&S_IFMT == S_IFREG {
+			writtenInodes[nid] = true
 		}
 	}
 
