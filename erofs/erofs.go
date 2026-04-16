@@ -26,9 +26,11 @@
 package erofs
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -323,4 +325,31 @@ func splitPath(path string) []string {
 		}
 	}
 	return components
+}
+
+// IsValidPath reports whether path is an EROFS archive by inspecting its
+// magic bytes.
+func IsValidPath(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(SuperBlockOffset, io.SeekStart); err != nil {
+		return false
+	}
+
+	return IsValid(f)
+}
+
+// IsValid reports whether r is an EROFS archive by inspecting its magic bytes.
+func IsValid(r io.Reader) bool {
+	var magic uint32
+	err := binary.Read(r, binary.LittleEndian, &magic)
+	if err != nil {
+		return false
+	}
+
+	return magic == uint32(SuperBlockMagicV1)
 }
