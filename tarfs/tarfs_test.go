@@ -649,3 +649,79 @@ func TestTarFSCreate(t *testing.T) {
 
 	require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
 }
+
+func TestTarFSInodeTracking(t *testing.T) {
+	// Build a tar with: one regular file, two hardlinks to it, and an
+	// unrelated regular file.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	content := []byte("hello world")
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "original",
+		Size:     int64(len(content)),
+		Mode:     0o644,
+	}))
+	_, err := tw.Write(content)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeLink,
+		Name:     "link-a",
+		Linkname: "original",
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeLink,
+		Name:     "link-b",
+		Linkname: "original",
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "other",
+		Size:     int64(len(content)),
+		Mode:     0o644,
+	}))
+	_, err = tw.Write(content)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+
+	fsys, err := tarfs.Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	getHeader := func(name string) *tarfs.FileHeader {
+		t.Helper()
+		fi, err := fsys.Lstat(name)
+		require.NoError(t, err)
+		fh, ok := fi.Sys().(*tarfs.FileHeader)
+		require.True(t, ok, "Sys() should return *tarfs.FileHeader for %s", name)
+		return fh
+	}
+
+	orig := getHeader("original")
+	linkA := getHeader("link-a")
+	linkB := getHeader("link-b")
+	other := getHeader("other")
+
+	// All three hardlinks share the same inode.
+	require.Equal(t, orig.GetIno(), linkA.GetIno(), "link-a should share inode with original")
+	require.Equal(t, orig.GetIno(), linkB.GetIno(), "link-b should share inode with original")
+
+	// Nlink should be 3 (original + 2 hardlinks).
+	require.Equal(t, uint64(3), orig.GetNlink())
+	require.Equal(t, uint64(3), linkA.GetNlink())
+	require.Equal(t, uint64(3), linkB.GetNlink())
+
+	// The unrelated file has a different inode and nlink 1.
+	require.NotEqual(t, orig.GetIno(), other.GetIno(), "other should have a different inode")
+	require.Equal(t, uint64(1), other.GetNlink())
+
+	// All inodes should be non-zero.
+	require.NotZero(t, orig.GetIno())
+	require.NotZero(t, other.GetIno())
+
+}
