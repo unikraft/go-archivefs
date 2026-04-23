@@ -18,15 +18,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-
-	"github.com/unikraft/go-archivefs"
 )
 
 var (
-	_ fs.FS                = (*FS)(nil)
-	_ fs.ReadDirFS         = (*FS)(nil)
-	_ fs.StatFS            = (*FS)(nil)
-	_ archivefs.ReadLinkFS = (*FS)(nil)
+	_ fs.FS         = (*FS)(nil)
+	_ fs.ReadDirFS  = (*FS)(nil)
+	_ fs.StatFS     = (*FS)(nil)
+	_ fs.ReadLinkFS = (*FS)(nil)
 )
 
 type FS struct {
@@ -225,10 +223,8 @@ func (fsys *FS) ReadLink(name string) (string, error) {
 	return d.Linkname, nil
 }
 
-// StatLink returns a FileInfo describing the file without following any symbolic links.
-// Experimental implementation of fs.ReadLinkFS:
-// https://github.com/golang/go/issues/49580
-func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
+// Lstat returns a FileInfo describing the file without following any symbolic links.
+func (fsys *FS) Lstat(name string) (fs.FileInfo, error) {
 	d, err := resolve(&fsys.root, filepath.Dir(name))
 	if err != nil {
 		return nil, err

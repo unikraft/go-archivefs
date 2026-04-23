@@ -40,7 +40,6 @@
 package tarfs_test
 
 import (
-	"archive/tar"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -52,9 +51,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/unikraft/go-archivefs/internal/testutil"
 	"github.com/unikraft/go-archivefs/tarfs"
-	"github.com/stretchr/testify/require"
 )
 
 func TestTarFS(t *testing.T) {
@@ -408,7 +407,7 @@ func TestTarFS(t *testing.T) {
 					fi, err = f.Stat()
 					require.NoError(t, err)
 				} else {
-					fi, err = fsys.StatLink(file.Name)
+					fi, err = fsys.Lstat(file.Name)
 					require.NoError(t, err)
 				}
 
@@ -418,7 +417,7 @@ func TestTarFS(t *testing.T) {
 				require.Equal(t, file.ModTime, fi.ModTime())
 				require.Equal(t, file.IsDir, fi.IsDir())
 
-				stat, ok := fi.Sys().(*tar.Header)
+				stat, ok := fi.Sys().(*tarfs.FileHeader)
 				require.True(t, ok)
 
 				require.Equal(t, file.Mode, fs.FileMode(stat.Mode)&fs.ModePerm)
@@ -497,8 +496,8 @@ func TestTarFSStat(t *testing.T) {
 		require.Equal(t, fs.ModeDir|0o755, fi.Mode())
 	})
 
-	t.Run("StatLink", func(t *testing.T) {
-		fi, err := fsys.StatLink("bin")
+	t.Run("Lstat", func(t *testing.T) {
+		fi, err := fsys.Lstat("bin")
 		require.NoError(t, err)
 
 		require.False(t, fi.IsDir())
