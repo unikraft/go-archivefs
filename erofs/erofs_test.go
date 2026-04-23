@@ -10,13 +10,16 @@
 package erofs_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/rogpeppe/go-internal/dirhash"
 	"github.com/unikraft/go-archivefs/erofs"
@@ -378,3 +381,156 @@ func TestEROFSHardlinkDeduplication(t *testing.T) {
 		require.Equal(t, largeContent, content, "hardlink %s content should match original", linkPath)
 	}
 }
+
+// TestEROFSZeroInodeNoDedupe verifies that when the source filesystem returns
+// inode 0 for all files (i.e. no inode info available), the erofs writer does
+// not falsely deduplicate file data. Each file should have its own content.
+func TestEROFSZeroInodeNoDedupe(t *testing.T) {
+	fileA := []byte("content of file A")
+	fileB := []byte("content of file B")
+	fileC := []byte("content of file C")
+
+	src := &zeroInoFS{
+		files: map[string][]byte{
+			"a.txt": fileA,
+			"b.txt": fileB,
+			"c.txt": fileC,
+		},
+	}
+
+	dstFile, err := os.OpenFile(filepath.Join(t.TempDir(), "zero-ino.erofs"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, dstFile.Close())
+	})
+
+	require.NoError(t, erofs.Create(dstFile, src, erofs.WithAllRoot(true)))
+
+	fsys, err := erofs.Open(dstFile)
+	require.NoError(t, err)
+
+	for name, want := range src.files {
+		f, err := fsys.Open(name)
+		require.NoError(t, err)
+		got, err := io.ReadAll(f)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		require.Equal(t, want, got, "file %s should have its own content", name)
+	}
+}
+
+// zeroInoFS is a minimal fs.ReadLinkFS where every file's Sys() returns nil,
+// causing archivefs.GetIno to return 0.
+type zeroInoFS struct {
+	files map[string][]byte
+}
+
+func (z *zeroInoFS) Open(name string) (fs.File, error) {
+	if name == "." {
+		return &zeroInoDir{entries: z.sortedNames()}, nil
+	}
+	data, ok := z.files[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &zeroInoFile{name: name, data: data, reader: bytes.NewReader(data)}, nil
+}
+
+func (z *zeroInoFS) ReadLink(string) (string, error) {
+	return "", &fs.PathError{Op: "readlink", Err: fs.ErrInvalid}
+}
+
+func (z *zeroInoFS) Lstat(name string) (fs.FileInfo, error) {
+	if name == "." {
+		return &zeroInoDirInfo{}, nil
+	}
+	data, ok := z.files[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrNotExist}
+	}
+	return &zeroInoFileInfo{name: name, size: int64(len(data))}, nil
+}
+
+func (z *zeroInoFS) sortedNames() []string {
+	names := make([]string, 0, len(z.files))
+	for n := range z.files {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// zeroInoFile is an in-memory file whose Sys() returns nil.
+type zeroInoFile struct {
+	name   string
+	data   []byte
+	reader *bytes.Reader
+}
+
+func (f *zeroInoFile) Stat() (fs.FileInfo, error) {
+	return &zeroInoFileInfo{name: f.name, size: int64(len(f.data))}, nil
+}
+func (f *zeroInoFile) Read(b []byte) (int, error) { return f.reader.Read(b) }
+func (f *zeroInoFile) Close() error               { return nil }
+
+type zeroInoFileInfo struct {
+	name string
+	size int64
+}
+
+func (fi *zeroInoFileInfo) Name() string      { return filepath.Base(fi.name) }
+func (fi *zeroInoFileInfo) Size() int64       { return fi.size }
+func (fi *zeroInoFileInfo) Mode() fs.FileMode { return 0o644 }
+func (fi *zeroInoFileInfo) IsDir() bool       { return false }
+func (fi *zeroInoFileInfo) Sys() any          { return nil }
+func (fi *zeroInoFileInfo) ModTime() time.Time {
+	return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+}
+
+// zeroInoDir implements fs.ReadDirFile for the root directory.
+type zeroInoDir struct {
+	entries []string
+	offset  int
+}
+
+func (d *zeroInoDir) Stat() (fs.FileInfo, error) { return &zeroInoDirInfo{}, nil }
+func (d *zeroInoDir) Read([]byte) (int, error)   { return 0, io.EOF }
+func (d *zeroInoDir) Close() error               { return nil }
+func (d *zeroInoDir) ReadDir(n int) ([]fs.DirEntry, error) {
+	if n <= 0 {
+		var entries []fs.DirEntry
+		for _, name := range d.entries[d.offset:] {
+			entries = append(entries, &zeroInoDirEntry{name: name})
+		}
+		d.offset = len(d.entries)
+		return entries, nil
+	}
+	var entries []fs.DirEntry
+	for i := range n {
+		idx := d.offset + i
+		if idx >= len(d.entries) {
+			return entries, io.EOF
+		}
+		entries = append(entries, &zeroInoDirEntry{name: d.entries[idx]})
+	}
+	d.offset += len(entries)
+	return entries, nil
+}
+
+type zeroInoDirInfo struct{}
+
+func (di *zeroInoDirInfo) Name() string       { return "." }
+func (di *zeroInoDirInfo) Size() int64        { return 0 }
+func (di *zeroInoDirInfo) Mode() fs.FileMode  { return fs.ModeDir | 0o755 }
+func (di *zeroInoDirInfo) IsDir() bool        { return true }
+func (di *zeroInoDirInfo) Sys() any           { return nil }
+func (di *zeroInoDirInfo) ModTime() time.Time { return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC) }
+
+type zeroInoDirEntry struct {
+	name string
+}
+
+func (de *zeroInoDirEntry) Name() string               { return de.name }
+func (de *zeroInoDirEntry) IsDir() bool                { return false }
+func (de *zeroInoDirEntry) Type() fs.FileMode          { return 0 }
+func (de *zeroInoDirEntry) Info() (fs.FileInfo, error) { return &zeroInoFileInfo{name: de.name}, nil }

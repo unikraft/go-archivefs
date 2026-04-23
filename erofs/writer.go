@@ -182,7 +182,12 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				}
 				fsIno := archivefs.GetIno(info.Sys())
 
-				if entry, ok := w.linkMap[fsIno]; ok {
+				if fsIno == 0 {
+					// No valid inode info; skip deduplication.
+					ino.Ino = nid
+					ino.Size = uint32(size)
+					shouldAllocate = true
+				} else if entry, ok := w.linkMap[fsIno]; ok {
 					if entry.Count == 0 {
 						ino.Ino = nid
 						entry.Count = 1
@@ -233,7 +238,12 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				}
 				fsIno := archivefs.GetIno(info.Sys())
 
-				if entry, ok := w.linkMap[fsIno]; ok {
+				if fsIno == 0 {
+					// No valid inode info; skip deduplication.
+					ino.Ino = nid
+					ino.Size = uint64(size)
+					shouldAllocate = true
+				} else if entry, ok := w.linkMap[fsIno]; ok {
 					if entry.Count == 0 {
 						ino.Ino = nid
 						entry.Count = 1
@@ -430,9 +440,11 @@ func (w *writer) populateInodes() error {
 		} else {
 			nlink = int(archivefs.GetNlink(fi.Sys()))
 			ino := archivefs.GetIno(fi.Sys())
-			if _, ok := w.linkMap[ino]; !ok {
-				w.linkMap[ino] = inodeCount{
-					Count: 0,
+			if ino != 0 {
+				if _, ok := w.linkMap[ino]; !ok {
+					w.linkMap[ino] = inodeCount{
+						Count: 0,
+					}
 				}
 			}
 		}
