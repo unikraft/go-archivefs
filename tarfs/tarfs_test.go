@@ -40,6 +40,8 @@
 package tarfs_test
 
 import (
+	"archive/tar"
+	"bytes"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -459,6 +461,86 @@ func TestTarFSDirHash(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
+}
+
+func TestTarFSSpecialEntryTypes(t *testing.T) {
+	// Build a tar with device nodes, FIFOs, and regular files.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     "dev/",
+		Mode:     0o755,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeChar,
+		Name:     "dev/null",
+		Mode:     0o666,
+		Devmajor: 1,
+		Devminor: 3,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeBlock,
+		Name:     "dev/sda",
+		Mode:     0o660,
+		Devmajor: 8,
+		Devminor: 0,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeFifo,
+		Name:     "dev/fifo",
+		Mode:     0o644,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "hello.txt",
+		Size:     5,
+		Mode:     0o644,
+	}))
+	_, err := tw.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+
+	fsys, err := tarfs.Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	// Regular file should be readable.
+	f, err := fsys.Open("hello.txt")
+	require.NoError(t, err)
+	data, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.Equal(t, "hello", string(data))
+
+	// Device nodes and FIFOs should appear in directory listings.
+	entries, err := fsys.ReadDir("dev")
+	require.NoError(t, err)
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	require.Contains(t, names, "null")
+	require.Contains(t, names, "sda")
+	require.Contains(t, names, "fifo")
+
+	// Check file types via Lstat.
+	nullInfo, err := fsys.Lstat("dev/null")
+	require.NoError(t, err)
+	require.NotZero(t, nullInfo.Mode()&fs.ModeCharDevice)
+
+	sdaInfo, err := fsys.Lstat("dev/sda")
+	require.NoError(t, err)
+	require.NotZero(t, sdaInfo.Mode()&fs.ModeDevice)
+
+	fifoInfo, err := fsys.Lstat("dev/fifo")
+	require.NoError(t, err)
+	require.NotZero(t, fifoInfo.Mode()&fs.ModeNamedPipe)
 }
 
 func TestTarFSReadlink(t *testing.T) {

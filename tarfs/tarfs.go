@@ -55,12 +55,13 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			if _, err := io.Copy(io.Discard, tr); err != nil {
 				return nil, fmt.Errorf("failed to read file %s: %w", h.Name, err)
 			}
-		case tar.TypeDir, tar.TypeLink, tar.TypeSymlink:
+		case tar.TypeDir, tar.TypeLink, tar.TypeSymlink,
+			tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
 			// NOP
-		case tar.TypeXGlobalHeader:
+		case tar.TypeXGlobalHeader, tar.TypeXHeader:
 			continue // Ignore metadata-only entries.
 		default:
-			return nil, fmt.Errorf("unsupported file type: %s, %c", h.Name, h.Typeflag)
+			continue // Skip unknown entry types.
 		}
 
 		h.Name = sanitizePath(h.Name)
