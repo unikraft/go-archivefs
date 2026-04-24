@@ -14,8 +14,6 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-
-	"github.com/unikraft/go-archivefs"
 )
 
 // Create creates a tar archive from the given filesystem.
@@ -41,7 +39,7 @@ func Create(dst io.Writer, src fs.FS) error {
 
 		var link string
 		if d.Type()&fs.ModeSymlink != 0 {
-			linkFS, ok := src.(archivefs.ReadLinkFS)
+			linkFS, ok := src.(fs.ReadLinkFS)
 			if !ok {
 				return errors.New("source FS does not support symlinks")
 			}

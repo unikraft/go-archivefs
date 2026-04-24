@@ -611,6 +611,18 @@ func (ino *Inode) GID() uint32 {
 	return ino.gid
 }
 
+// GetIno implements [archivefs.InodeInfo].
+func (ino *Inode) GetIno() uint64 { return ino.Nid() }
+
+// GetNlink implements [archivefs.InodeInfo].
+func (ino *Inode) GetNlink() uint64 { return uint64(ino.Nlink()) }
+
+// GetUID implements [archivefs.OwnerInfo].
+func (ino *Inode) GetUID() int { return int(ino.UID()) }
+
+// GetGID implements [archivefs.OwnerInfo].
+func (ino *Inode) GetGID() int { return int(ino.GID()) }
+
 // Data returns the read-only file data of this inode.
 func (ino *Inode) Data() (io.Reader, error) {
 	switch dataLayout := ino.DataLayout(); dataLayout {

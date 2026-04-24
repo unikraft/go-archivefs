@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/unikraft/go-archivefs"
 )
 
 const (
@@ -179,9 +180,14 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				if err != nil {
 					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
 				}
-				fsIno := getIno(info)
+				fsIno := archivefs.GetIno(info.Sys())
 
-				if entry, ok := w.linkMap[fsIno]; ok {
+				if fsIno == 0 {
+					// No valid inode info; skip deduplication.
+					ino.Ino = nid
+					ino.Size = uint32(size)
+					shouldAllocate = true
+				} else if entry, ok := w.linkMap[fsIno]; ok {
 					if entry.Count == 0 {
 						ino.Ino = nid
 						entry.Count = 1
@@ -230,9 +236,14 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				if err != nil {
 					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
 				}
-				fsIno := getIno(info)
+				fsIno := archivefs.GetIno(info.Sys())
 
-				if entry, ok := w.linkMap[fsIno]; ok {
+				if fsIno == 0 {
+					// No valid inode info; skip deduplication.
+					ino.Ino = nid
+					ino.Size = uint64(size)
+					shouldAllocate = true
+				} else if entry, ok := w.linkMap[fsIno]; ok {
 					if entry.Count == 0 {
 						ino.Ino = nid
 						entry.Count = 1
@@ -427,11 +438,13 @@ func (w *writer) populateInodes() error {
 
 			nlink = len(entries) + 2
 		} else {
-			nlink = getNLinks(fi)
-			ino := getIno(fi)
-			if _, ok := w.linkMap[ino]; !ok {
-				w.linkMap[ino] = inodeCount{
-					Count: 0,
+			nlink = int(archivefs.GetNlink(fi.Sys()))
+			ino := archivefs.GetIno(fi.Sys())
+			if ino != 0 {
+				if _, ok := w.linkMap[ino]; !ok {
+					w.linkMap[ino] = inodeCount{
+						Count: 0,
+					}
 				}
 			}
 		}
@@ -618,7 +631,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 		uid = originalFInfo.Uid
 		gid = originalFInfo.Gid
 	default:
-		uid, gid = getOwner(fi)
+		uid, gid = archivefs.GetUID(fi.Sys()), archivefs.GetGID(fi.Sys())
 	}
 
 	// Clear permission bits from 'mode' and set the ones from originalFInfo.mode

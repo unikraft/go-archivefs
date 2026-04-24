@@ -15,18 +15,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-
-	"github.com/unikraft/go-archivefs"
 )
 
 var (
-	_ fs.FS                = (*FS)(nil)
-	_ fs.ReadDirFS         = (*FS)(nil)
-	_ fs.StatFS            = (*FS)(nil)
-	_ archivefs.ReadLinkFS = (*FS)(nil)
+	_ fs.FS         = (*FS)(nil)
+	_ fs.ReadDirFS  = (*FS)(nil)
+	_ fs.StatFS     = (*FS)(nil)
+	_ fs.ReadLinkFS = (*FS)(nil)
 )
 
 type FS struct {
@@ -57,12 +56,13 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			if _, err := io.Copy(io.Discard, tr); err != nil {
 				return nil, fmt.Errorf("failed to read file %s: %w", h.Name, err)
 			}
-		case tar.TypeDir, tar.TypeLink, tar.TypeSymlink:
+		case tar.TypeDir, tar.TypeLink, tar.TypeSymlink,
+			tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
 			// NOP
-		case tar.TypeXGlobalHeader:
+		case tar.TypeXGlobalHeader, tar.TypeXHeader:
 			continue // Ignore metadata-only entries.
 		default:
-			return nil, fmt.Errorf("unsupported file type: %s, %c", h.Name, h.Typeflag)
+			continue // Skip unknown entry types.
 		}
 
 		h.Name = sanitizePath(h.Name)
@@ -103,6 +103,21 @@ func Open(ra io.ReaderAt) (*FS, error) {
 		}
 	}
 
+	// Assign synthetic inode numbers. Hardlinks share the same inode.
+	var nextIno uint64
+	// targetToIno maps hardlink target paths to their assigned inode.
+	targetToIno := map[string]uint64{}
+	// targetNlink counts the number of links for each hardlink target.
+	targetNlink := map[string]int{}
+
+	// First pass: count hardlinks and assign inodes to targets.
+	for _, d := range dirents {
+		if d.Typeflag == tar.TypeLink {
+			target := sanitizePath(d.Linkname)
+			targetNlink[target]++
+		}
+	}
+
 	// Point hardlinks to the underlying dirent.
 	for path, d := range dirents {
 		if d.Typeflag == tar.TypeLink {
@@ -112,9 +127,30 @@ func Open(ra io.ReaderAt) (*FS, error) {
 				return nil, fmt.Errorf("failed to resolve hardlink %q: %w", name, fs.ErrNotExist)
 			}
 
+			// Assign an inode to the target if not yet assigned.
+			ino, ok := targetToIno[name]
+			if !ok {
+				nextIno++
+				ino = nextIno
+				targetToIno[name] = ino
+				target.ino = ino
+				target.nlink = uint64(targetNlink[name] + 1) // +1 for the target itself
+			}
+
 			targetCopy := *target
 			targetCopy.Header.Name = path
+			targetCopy.ino = ino
+			targetCopy.nlink = target.nlink
 			dirents[path] = &targetCopy
+		}
+	}
+
+	// Second pass: assign unique inodes to all remaining entries.
+	for _, d := range dirents {
+		if d.ino == 0 {
+			nextIno++
+			d.ino = nextIno
+			d.nlink = 1
 		}
 	}
 
@@ -225,10 +261,8 @@ func (fsys *FS) ReadLink(name string) (string, error) {
 	return d.Linkname, nil
 }
 
-// StatLink returns a FileInfo describing the file without following any symbolic links.
-// Experimental implementation of fs.ReadLinkFS:
-// https://github.com/golang/go/issues/49580
-func (fsys *FS) StatLink(name string) (fs.FileInfo, error) {
+// Lstat returns a FileInfo describing the file without following any symbolic links.
+func (fsys *FS) Lstat(name string) (fs.FileInfo, error) {
 	d, err := resolve(&fsys.root, filepath.Dir(name))
 	if err != nil {
 		return nil, err
@@ -308,6 +342,8 @@ type dirent struct {
 	parent   *dirent
 	children map[string]*dirent
 	data     func() io.Reader
+	ino      uint64
+	nlink    uint64
 }
 
 func (d *dirent) findChild(name string) (*dirent, bool) {
@@ -359,8 +395,40 @@ func (d *dirent) Type() fs.FileMode {
 }
 
 func (d *dirent) Info() (fs.FileInfo, error) {
-	return d.FileInfo(), nil
+	return &fileInfo{FileInfo: d.FileInfo(), hdr: &d.Header, ino: d.ino, nlink: d.nlink}, nil
 }
+
+// fileInfo wraps an fs.FileInfo to provide synthetic inode numbers and
+// tar header metadata via Sys().
+type fileInfo struct {
+	fs.FileInfo
+	hdr   *tar.Header
+	ino   uint64
+	nlink uint64
+}
+
+func (fi *fileInfo) Sys() any {
+	return &FileHeader{
+		Header: fi.hdr,
+		ino:    fi.ino,
+		nlink:  fi.nlink,
+	}
+}
+
+// FileHeader is returned by FileInfo.Sys() for files in a tarfs filesystem.
+// It carries the original tar header along with synthetic inode metadata
+// assigned during archive parsing. It implements [archivefs.InodeInfo] and
+// [archivefs.OwnerInfo].
+type FileHeader struct {
+	*tar.Header
+	ino   uint64
+	nlink uint64
+}
+
+func (fh *FileHeader) GetIno() uint64   { return fh.ino }
+func (fh *FileHeader) GetNlink() uint64 { return fh.nlink }
+func (fh *FileHeader) GetUID() int      { return fh.Header.Uid }
+func (fh *FileHeader) GetGID() int      { return fh.Header.Gid }
 
 // readerWithOffset is a wrapper around io.ReaderAt that keeps track of the current offset.
 type readerWithOffset struct {
@@ -372,4 +440,24 @@ func (f *readerWithOffset) Read(p []byte) (n int, err error) {
 	n, err = f.ra.ReadAt(p, f.offset)
 	f.offset += int64(n)
 	return
+}
+
+// IsValidPath reports whether path is a tar archive by attempting to read
+// its first entry header.
+func IsValidPath(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	return IsValid(f)
+}
+
+// IsValid reports whether r is a tar archive by attempting to read its first
+// entry header.
+func IsValid(r io.Reader) bool {
+	tr := tar.NewReader(r)
+	_, err := tr.Next()
+	return err == nil
 }

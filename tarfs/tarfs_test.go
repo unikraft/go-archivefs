@@ -41,6 +41,7 @@ package tarfs_test
 
 import (
 	"archive/tar"
+	"bytes"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -52,9 +53,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/unikraft/go-archivefs/internal/testutil"
 	"github.com/unikraft/go-archivefs/tarfs"
-	"github.com/stretchr/testify/require"
 )
 
 func TestTarFS(t *testing.T) {
@@ -408,7 +409,7 @@ func TestTarFS(t *testing.T) {
 					fi, err = f.Stat()
 					require.NoError(t, err)
 				} else {
-					fi, err = fsys.StatLink(file.Name)
+					fi, err = fsys.Lstat(file.Name)
 					require.NoError(t, err)
 				}
 
@@ -418,7 +419,7 @@ func TestTarFS(t *testing.T) {
 				require.Equal(t, file.ModTime, fi.ModTime())
 				require.Equal(t, file.IsDir, fi.IsDir())
 
-				stat, ok := fi.Sys().(*tar.Header)
+				stat, ok := fi.Sys().(*tarfs.FileHeader)
 				require.True(t, ok)
 
 				require.Equal(t, file.Mode, fs.FileMode(stat.Mode)&fs.ModePerm)
@@ -462,6 +463,86 @@ func TestTarFSDirHash(t *testing.T) {
 	require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
 }
 
+func TestTarFSSpecialEntryTypes(t *testing.T) {
+	// Build a tar with device nodes, FIFOs, and regular files.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     "dev/",
+		Mode:     0o755,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeChar,
+		Name:     "dev/null",
+		Mode:     0o666,
+		Devmajor: 1,
+		Devminor: 3,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeBlock,
+		Name:     "dev/sda",
+		Mode:     0o660,
+		Devmajor: 8,
+		Devminor: 0,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeFifo,
+		Name:     "dev/fifo",
+		Mode:     0o644,
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "hello.txt",
+		Size:     5,
+		Mode:     0o644,
+	}))
+	_, err := tw.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+
+	fsys, err := tarfs.Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	// Regular file should be readable.
+	f, err := fsys.Open("hello.txt")
+	require.NoError(t, err)
+	data, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.Equal(t, "hello", string(data))
+
+	// Device nodes and FIFOs should appear in directory listings.
+	entries, err := fsys.ReadDir("dev")
+	require.NoError(t, err)
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	require.Contains(t, names, "null")
+	require.Contains(t, names, "sda")
+	require.Contains(t, names, "fifo")
+
+	// Check file types via Lstat.
+	nullInfo, err := fsys.Lstat("dev/null")
+	require.NoError(t, err)
+	require.NotZero(t, nullInfo.Mode()&fs.ModeCharDevice)
+
+	sdaInfo, err := fsys.Lstat("dev/sda")
+	require.NoError(t, err)
+	require.NotZero(t, sdaInfo.Mode()&fs.ModeDevice)
+
+	fifoInfo, err := fsys.Lstat("dev/fifo")
+	require.NoError(t, err)
+	require.NotZero(t, fifoInfo.Mode()&fs.ModeNamedPipe)
+}
+
 func TestTarFSReadlink(t *testing.T) {
 	f, err := os.Open("testdata/toybox.tar")
 	require.NoError(t, err)
@@ -497,8 +578,8 @@ func TestTarFSStat(t *testing.T) {
 		require.Equal(t, fs.ModeDir|0o755, fi.Mode())
 	})
 
-	t.Run("StatLink", func(t *testing.T) {
-		fi, err := fsys.StatLink("bin")
+	t.Run("Lstat", func(t *testing.T) {
+		fi, err := fsys.Lstat("bin")
 		require.NoError(t, err)
 
 		require.False(t, fi.IsDir())
@@ -567,4 +648,80 @@ func TestTarFSCreate(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "h1:adgxkqVceeKMyJdMZMvcUIbg94TthnXUmOeufCPuzQI=", h)
+}
+
+func TestTarFSInodeTracking(t *testing.T) {
+	// Build a tar with: one regular file, two hardlinks to it, and an
+	// unrelated regular file.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	content := []byte("hello world")
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "original",
+		Size:     int64(len(content)),
+		Mode:     0o644,
+	}))
+	_, err := tw.Write(content)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeLink,
+		Name:     "link-a",
+		Linkname: "original",
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeLink,
+		Name:     "link-b",
+		Linkname: "original",
+	}))
+
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "other",
+		Size:     int64(len(content)),
+		Mode:     0o644,
+	}))
+	_, err = tw.Write(content)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+
+	fsys, err := tarfs.Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	getHeader := func(name string) *tarfs.FileHeader {
+		t.Helper()
+		fi, err := fsys.Lstat(name)
+		require.NoError(t, err)
+		fh, ok := fi.Sys().(*tarfs.FileHeader)
+		require.True(t, ok, "Sys() should return *tarfs.FileHeader for %s", name)
+		return fh
+	}
+
+	orig := getHeader("original")
+	linkA := getHeader("link-a")
+	linkB := getHeader("link-b")
+	other := getHeader("other")
+
+	// All three hardlinks share the same inode.
+	require.Equal(t, orig.GetIno(), linkA.GetIno(), "link-a should share inode with original")
+	require.Equal(t, orig.GetIno(), linkB.GetIno(), "link-b should share inode with original")
+
+	// Nlink should be 3 (original + 2 hardlinks).
+	require.Equal(t, uint64(3), orig.GetNlink())
+	require.Equal(t, uint64(3), linkA.GetNlink())
+	require.Equal(t, uint64(3), linkB.GetNlink())
+
+	// The unrelated file has a different inode and nlink 1.
+	require.NotEqual(t, orig.GetIno(), other.GetIno(), "other should have a different inode")
+	require.Equal(t, uint64(1), other.GetNlink())
+
+	// All inodes should be non-zero.
+	require.NotZero(t, orig.GetIno())
+	require.NotZero(t, other.GetIno())
+
 }
