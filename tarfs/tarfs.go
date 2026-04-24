@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -439,4 +440,24 @@ func (f *readerWithOffset) Read(p []byte) (n int, err error) {
 	n, err = f.ra.ReadAt(p, f.offset)
 	f.offset += int64(n)
 	return
+}
+
+// IsValidPath reports whether path is a tar archive by attempting to read
+// its first entry header.
+func IsValidPath(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	return IsValid(f)
+}
+
+// IsValid reports whether r is a tar archive by attempting to read its first
+// entry header.
+func IsValid(r io.Reader) bool {
+	tr := tar.NewReader(r)
+	_, err := tr.Next()
+	return err == nil
 }
