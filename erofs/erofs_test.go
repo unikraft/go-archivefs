@@ -612,6 +612,18 @@ func (z *zeroUTCModTimeFS) Open(name string) (fs.File, error) {
 	return &zeroUTCModTimeFile{File: f}, nil
 }
 
+func (z *zeroUTCModTimeFS) ReadLink(name string) (string, error) {
+	return z.FS.(fs.ReadLinkFS).ReadLink(name)
+}
+
+func (z *zeroUTCModTimeFS) Lstat(name string) (fs.FileInfo, error) {
+	info, err := z.FS.(fs.ReadLinkFS).Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	return &zeroUTCFileInfo{FileInfo: info}, nil
+}
+
 type zeroUTCModTimeFile struct {
 	fs.File
 }
@@ -672,6 +684,14 @@ func (c *countingFS) Open(name string) (fs.File, error) {
 	c.counts[name]++
 	c.mu.Unlock()
 	return c.FS.Open(name)
+}
+
+func (c *countingFS) ReadLink(name string) (string, error) {
+	return c.FS.(fs.ReadLinkFS).ReadLink(name)
+}
+
+func (c *countingFS) Lstat(name string) (fs.FileInfo, error) {
+	return c.FS.(fs.ReadLinkFS).Lstat(name)
 }
 
 func TestEROFSFileOpenedOnce(t *testing.T) {
@@ -1007,7 +1027,11 @@ type zeroInoFS struct {
 
 func (z *zeroInoFS) Open(name string) (fs.File, error) {
 	if name == "." {
-		return &zeroInoDir{entries: z.sortedNames()}, nil
+		sizes := make(map[string]int64)
+		for n, d := range z.files {
+			sizes[n] = int64(len(d))
+		}
+		return &zeroInoDir{entries: z.sortedNames(), sizes: sizes}, nil
 	}
 	data, ok := z.files[name]
 	if !ok {
@@ -1070,6 +1094,7 @@ func (fi *zeroInoFileInfo) ModTime() time.Time {
 // zeroInoDir implements fs.ReadDirFile for the root directory.
 type zeroInoDir struct {
 	entries []string
+	sizes   map[string]int64
 	offset  int
 }
 
@@ -1080,7 +1105,7 @@ func (d *zeroInoDir) ReadDir(n int) ([]fs.DirEntry, error) {
 	if n <= 0 {
 		var entries []fs.DirEntry
 		for _, name := range d.entries[d.offset:] {
-			entries = append(entries, &zeroInoDirEntry{name: name})
+			entries = append(entries, &zeroInoDirEntry{name: name, size: d.sizes[name]})
 		}
 		d.offset = len(d.entries)
 		return entries, nil
@@ -1091,7 +1116,7 @@ func (d *zeroInoDir) ReadDir(n int) ([]fs.DirEntry, error) {
 		if idx >= len(d.entries) {
 			return entries, io.EOF
 		}
-		entries = append(entries, &zeroInoDirEntry{name: d.entries[idx]})
+		entries = append(entries, &zeroInoDirEntry{name: d.entries[idx], size: d.sizes[d.entries[idx]]})
 	}
 	d.offset += len(entries)
 	return entries, nil
@@ -1108,9 +1133,12 @@ func (di *zeroInoDirInfo) ModTime() time.Time { return time.Date(2025, 1, 1, 0, 
 
 type zeroInoDirEntry struct {
 	name string
+	size int64
 }
 
-func (de *zeroInoDirEntry) Name() string               { return de.name }
-func (de *zeroInoDirEntry) IsDir() bool                { return false }
-func (de *zeroInoDirEntry) Type() fs.FileMode          { return 0 }
-func (de *zeroInoDirEntry) Info() (fs.FileInfo, error) { return &zeroInoFileInfo{name: de.name}, nil }
+func (de *zeroInoDirEntry) Name() string      { return de.name }
+func (de *zeroInoDirEntry) IsDir() bool       { return false }
+func (de *zeroInoDirEntry) Type() fs.FileMode { return 0 }
+func (de *zeroInoDirEntry) Info() (fs.FileInfo, error) {
+	return &zeroInoFileInfo{name: de.name, size: de.size}, nil
+}
