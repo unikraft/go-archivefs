@@ -31,6 +31,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -233,12 +234,12 @@ func (fsys *Filesystem) resolveDepth(name string, noResolveLastSymlink bool, rem
 			if err != nil {
 				return nil, err
 			}
-			link = filepath.Clean(link)
+			link = path.Clean(link)
 
 			if strings.HasPrefix(link, "/") {
 				link = strings.TrimPrefix(link, "/")
 			} else {
-				link = filepath.Join(strings.Join(components[:i], "/"), link)
+				link = path.Join(strings.Join(components[:i], "/"), link)
 			}
 
 			child, err = fsys.resolveDepth(link, noResolveLastSymlink, remaining-1)
