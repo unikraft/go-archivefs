@@ -394,9 +394,10 @@ func TestTarFS(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, file := range v.files {
-				// Skip entries with names that are not valid fs.FS paths
-				// (e.g. non-UTF8 filenames, trailing slashes).
+				// Entries with names that are not valid fs.FS paths should error.
 				if !fs.ValidPath(file.Name) {
+					_, err := fsys.Open(file.Name)
+					require.Error(t, err, "expected error for invalid path %q", file.Name)
 					continue
 				}
 
