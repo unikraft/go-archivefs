@@ -369,7 +369,6 @@ func resolveDepth(root *dirent, name string, remaining int) (*dirent, error) {
 
 func sanitizePath(name string) string {
 	name = strings.ReplaceAll(name, "\\", "/")
-	name = strings.ReplaceAll(name, "//", "/")
 
 	cleaned := path.Clean(name)
 	switch cleaned {
@@ -378,9 +377,8 @@ func sanitizePath(name string) string {
 	}
 
 	cleaned = strings.TrimPrefix(cleaned, "/")
-	cleaned = strings.TrimPrefix(cleaned, "./")
 
-	if strings.HasPrefix(cleaned, "..") {
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return ""
 	}
 
