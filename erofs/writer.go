@@ -17,8 +17,10 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	stdpath "path"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -56,6 +58,7 @@ type writer struct {
 	dst        io.WriterAt
 	inodes     map[string]any
 	inodeOrder []string
+	fileSizes  map[string]int64
 	linkMap    map[uint64]inodeCount
 	opts       ErofsCreateOptions
 }
@@ -89,6 +92,20 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write data blocks: %w", err)
 	}
 
+	rootIno, ok := w.inodes["."]
+	if !ok {
+		return fmt.Errorf("root inode not found")
+	}
+	var rootNid uint16
+	switch ino := rootIno.(type) {
+	case InodeCompact:
+		rootNid = uint16(ino.Ino)
+	case InodeExtended:
+		rootNid = uint16(ino.Ino)
+	default:
+		return fmt.Errorf("unsupported root inode type %T", rootIno)
+	}
+
 	// Generate a UUID for the filesystem.
 	uuidBytes, err := uuid.New().MarshalBinary()
 	if err != nil {
@@ -102,6 +119,7 @@ func (w *writer) write() error {
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
 		BlockSizeBits: BlockSizeBits,
+		RootNid:       rootNid,
 		Inodes:        uint64(len(w.inodes)),
 		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
@@ -134,11 +152,30 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
-		data, size, err := w.dataForInode(path, ino)
-		if err != nil {
-			return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
+		// For regular files, use the cached size from populateInodes to avoid
+		// opening the file twice (once here for size, once in the write phase
+		// for data). Directories and symlinks must still call dataForInode
+		// because their encoded size differs from fi.Size().
+		var size int64
+		var mode uint16
+		switch ino := ino.(type) {
+		case InodeCompact:
+			mode = ino.Mode
+		case InodeExtended:
+			mode = ino.Mode
 		}
-		_ = data.Close()
+		if mode&S_IFMT == S_IFREG {
+			size = w.fileSizes[path]
+		} else {
+			data, sz, err := w.dataForInode(path, ino)
+			if err != nil {
+				return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
+			}
+			if err := data.Close(); err != nil {
+				return metaSize, dataSize, fmt.Errorf("failed to close data for %q: %w", path, err)
+			}
+			size = sz
+		}
 
 		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
 		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
@@ -418,6 +455,7 @@ func (w *writer) writeData() error {
 
 func (w *writer) populateInodes() error {
 	w.inodes = map[string]any{}
+	w.fileSizes = map[string]int64{}
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -467,6 +505,7 @@ func (w *writer) populateInodes() error {
 
 		w.inodes[path] = toInode(fi, nlink, w.opts.allRoot, originalFInfo)
 		w.inodeOrder = append(w.inodeOrder, path)
+		w.fileSizes[path] = fi.Size()
 
 		return nil
 	})
@@ -524,7 +563,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		// Add information about the parent directory.
 		if path != "." {
-			parentNid, err := w.findInodeAtPath(filepath.Join(path, ".."))
+			parentNid, err := w.findInodeAtPath(stdpath.Join(path, ".."))
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 			}
@@ -542,10 +581,10 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		names = append(names, "..")
 
 		for _, de := range entries {
-			path := filepath.Clean(filepath.Join(path, de.Name()))
-			nid, err := w.findInodeAtPath(path)
+			childPath := stdpath.Join(path, de.Name())
+			nid, err := w.findInodeAtPath(childPath)
 			if err != nil {
-				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
+				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", childPath, err)
 			}
 
 			dirents = append(dirents, Dirent{
@@ -555,22 +594,12 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 			names = append(names, de.Name())
 		}
 
-		// Sort the directory entries by name.
-		type pair struct {
-			d  Dirent
-			nm string
-		}
-		pairs := make([]pair, len(names))
-		for i := range names {
-			pairs[i] = pair{d: dirents[i], nm: names[i]}
-		}
-		sort.Slice(pairs, func(i, j int) bool {
-			return pairs[i].nm < pairs[j].nm
-		})
-		for i := range pairs {
-			dirents[i] = pairs[i].d
-			names[i] = pairs[i].nm
-		}
+		// EROFS requires directory entries in strict alphabetical order
+		// for binary search lookup. Sort all entries (including . and ..)
+		// by name. Previously . and .. were hardcoded at the front, which
+		// broke lookup for filenames starting with characters before '.'
+		// in ASCII (e.g. '#' = 0x23 < '.' = 0x2E).
+		sortDirents(dirents, names)
 
 		buf, err := encodeDirents(dirents, names)
 		if err != nil {
@@ -600,7 +629,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 }
 
 func (w *writer) findInodeAtPath(path string) (uint64, error) {
-	cleanPath := filepath.Clean(path)
+	cleanPath := stdpath.Clean(path)
 
 	ino, ok := w.inodes[cleanPath]
 	if !ok {
@@ -641,7 +670,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 
 	compact := fi.Size() <= math.MaxUint32 &&
 		uid <= math.MaxUint16 && gid <= math.MaxUint16 &&
-		fi.ModTime().Equal(time.Time{})
+		fi.ModTime().IsZero()
 
 	if compact {
 		return InodeCompact{
@@ -776,4 +805,24 @@ func roundUp(x, align int64) int64 {
 	}
 
 	return (x + align - 1) &^ (align - 1)
+}
+
+// sortDirents sorts dirents and names together by name, so that directory
+// entries are in strict alphabetical order as required by EROFS.
+func sortDirents(dirents []Dirent, names []string) {
+	type pair struct {
+		d Dirent
+		n string
+	}
+	pairs := make([]pair, len(dirents))
+	for i := range dirents {
+		pairs[i] = pair{dirents[i], names[i]}
+	}
+	slices.SortFunc(pairs, func(a, b pair) int {
+		return strings.Compare(a.n, b.n)
+	})
+	for i, p := range pairs {
+		dirents[i] = p.d
+		names[i] = p.n
+	}
 }

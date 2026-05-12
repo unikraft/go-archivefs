@@ -32,7 +32,7 @@ func fileTypeFromFileMode(mode fs.FileMode) uint8 {
 		return FT_SYMLINK
 	case fs.ModeDevice:
 		return FT_BLKDEV
-	case fs.ModeCharDevice:
+	case fs.ModeDevice | fs.ModeCharDevice:
 		return FT_CHRDEV
 	case fs.ModeNamedPipe:
 		return FT_FIFO
@@ -68,7 +68,7 @@ func statModeFromFileMode(mode fs.FileMode) uint16 {
 		stMode |= S_IFLNK
 	case fs.ModeDevice:
 		stMode |= S_IFBLK
-	case fs.ModeCharDevice:
+	case fs.ModeDevice | fs.ModeCharDevice:
 		stMode |= S_IFCHR
 	case fs.ModeNamedPipe:
 		stMode |= S_IFIFO
