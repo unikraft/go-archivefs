@@ -339,6 +339,101 @@ func TestEROFSFilenamesSortingBeforeDotRoot(t *testing.T) {
 	require.Equal(t, "zebra.txt", info.Name())
 }
 
+func TestEROFSHiddenFilenames(t *testing.T) {
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	writeFile := func(name string, content []byte) {
+		t.Helper()
+		require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Size: int64(len(content)), Mode: 0o644}))
+		_, err := tw.Write(content)
+		require.NoError(t, err)
+	}
+
+	// Root-level hidden files.
+	writeFile(".hidden", []byte("hidden-content"))
+	writeFile("..double", []byte("double-dot-content"))
+	writeFile("normal.txt", []byte("normal"))
+
+	// Sub-directory with hidden files (so the directory has both "." and ".." entries).
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "subdir/", Mode: 0o755}))
+	writeFile("subdir/.hidden", []byte("sub-hidden"))
+	writeFile("subdir/..double", []byte("sub-double"))
+	writeFile("subdir/normal.txt", []byte("sub-normal"))
+
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
+
+	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "hidden.img"), os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, imgFile.Close())
+	})
+
+	require.NoError(t, erofs.Create(imgFile, srcFS))
+
+	fsys, err := erofs.Open(imgFile)
+	require.NoError(t, err)
+
+	type fileCase struct {
+		path    string
+		name    string
+		content string
+	}
+
+	cases := []fileCase{
+		{".hidden", ".hidden", "hidden-content"},
+		{"..double", "..double", "double-dot-content"},
+		{"normal.txt", "normal.txt", "normal"},
+		{"subdir/.hidden", ".hidden", "sub-hidden"},
+		{"subdir/..double", "..double", "sub-double"},
+		{"subdir/normal.txt", "normal.txt", "sub-normal"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			// Stat must find the file via binary-search lookup.
+			info, err := fsys.Stat(tc.path)
+			require.NoError(t, err)
+			require.Equal(t, tc.name, info.Name())
+			require.False(t, info.IsDir())
+
+			// Open must return readable content.
+			f, err := fsys.Open(tc.path)
+			require.NoError(t, err)
+			data, err := io.ReadAll(f)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			require.Equal(t, tc.content, string(data))
+		})
+	}
+
+	// ReadDir at root must include the hidden files (not filter them out).
+	rootEntries, err := fsys.ReadDir(".")
+	require.NoError(t, err)
+
+	rootNames := make([]string, len(rootEntries))
+	for i, e := range rootEntries {
+		rootNames[i] = e.Name()
+	}
+	require.Contains(t, rootNames, ".hidden")
+	require.Contains(t, rootNames, "..double")
+	require.Contains(t, rootNames, "normal.txt")
+	require.Contains(t, rootNames, "subdir")
+
+	// ReadDir for the sub-directory must also expose its hidden files.
+	subEntries, err := fsys.ReadDir("subdir")
+	require.NoError(t, err)
+
+	subNames := make([]string, len(subEntries))
+	for i, e := range subEntries {
+		subNames[i] = e.Name()
+	}
+	require.Contains(t, subNames, ".hidden")
+	require.Contains(t, subNames, "..double")
+	require.Contains(t, subNames, "normal.txt")
+}
+
 func TestEROFSSymlinkCycleDetection(t *testing.T) {
 	// Create a tar archive with circular symlinks: a -> b, b -> a.
 	var tarBuf bytes.Buffer
