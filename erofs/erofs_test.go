@@ -25,7 +25,6 @@ import (
 
 	"github.com/rogpeppe/go-internal/dirhash"
 	"github.com/unikraft/go-archivefs/erofs"
-	"github.com/unikraft/go-archivefs/memfs"
 	"github.com/unikraft/go-archivefs/tarfs"
 
 	"github.com/stretchr/testify/require"
@@ -251,15 +250,25 @@ func TestEROFSFilenamesSortingBeforeDot(t *testing.T) {
 	// (0x21 through 0x2D)
 	prefixes := []string{"!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-"}
 
-	srcFS := memfs.New()
-	require.NoError(t, srcFS.MkdirAll("dir", 0o755))
-
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "dir/", Mode: 0o755}))
+	var err error
 	for _, p := range prefixes {
 		name := p + "file.txt"
-		require.NoError(t, srcFS.WriteFile(filepath.Join("dir", name), []byte("content-"+p), 0o644))
+		content := []byte("content-" + p)
+		require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/" + name, Size: int64(len(content)), Mode: 0o644}))
+		_, err = tw.Write(content)
+		require.NoError(t, err)
 	}
 	// Also add a file that sorts after '.' for good measure.
-	require.NoError(t, srcFS.WriteFile("dir/normal.txt", []byte("normal"), 0o644))
+	normalContent := []byte("normal")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/normal.txt", Size: int64(len(normalContent)), Mode: 0o644}))
+	_, err = tw.Write(normalContent)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "sort.img"), os.O_RDWR|os.O_CREATE, 0o644)
 	require.NoError(t, err)
@@ -300,12 +309,23 @@ func TestEROFSFilenamesSortingBeforeDotRoot(t *testing.T) {
 	// (no '..' entry). Verifies the root directory case is also sorted correctly.
 	prefixes := []string{"!", "#", "-"}
 
-	srcFS := memfs.New()
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	var err error
 	for _, p := range prefixes {
 		name := p + "root.txt"
-		require.NoError(t, srcFS.WriteFile(name, []byte("root-"+p), 0o644))
+		content := []byte("root-" + p)
+		require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Size: int64(len(content)), Mode: 0o644}))
+		_, err = tw.Write(content)
+		require.NoError(t, err)
 	}
-	require.NoError(t, srcFS.WriteFile("zebra.txt", []byte("zebra"), 0o644))
+	zebraContent := []byte("zebra")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "zebra.txt", Size: int64(len(zebraContent)), Mode: 0o644}))
+	_, err = tw.Write(zebraContent)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "rootsort.img"), os.O_RDWR|os.O_CREATE, 0o644)
 	require.NoError(t, err)
@@ -529,8 +549,15 @@ func TestEROFSStatLink(t *testing.T) {
 
 func TestEROFSSuperBlockChecksum(t *testing.T) {
 	// Create a valid image.
-	srcFS := memfs.New()
-	require.NoError(t, srcFS.WriteFile("hello.txt", []byte("hello"), 0o644))
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	helloContent := []byte("hello")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "hello.txt", Size: int64(len(helloContent)), Mode: 0o644}))
+	_, err := tw.Write(helloContent)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "checksum.img"), os.O_RDWR|os.O_CREATE, 0o644)
 	require.NoError(t, err)
@@ -559,9 +586,16 @@ func TestEROFSSuperBlockChecksum(t *testing.T) {
 
 func TestEROFSRootNidSet(t *testing.T) {
 	// Verify the writer explicitly sets RootNid in the superblock.
-	srcFS := memfs.New()
-	require.NoError(t, srcFS.MkdirAll("subdir", 0o755))
-	require.NoError(t, srcFS.WriteFile("subdir/file.txt", []byte("data"), 0o644))
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "subdir/", Mode: 0o755}))
+	fileData := []byte("data")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "subdir/file.txt", Size: int64(len(fileData)), Mode: 0o644}))
+	_, err := tw.Write(fileData)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "rootnid.img"), os.O_RDWR|os.O_CREATE, 0o644)
 	require.NoError(t, err)
@@ -580,8 +614,15 @@ func TestEROFSRootNidSet(t *testing.T) {
 
 func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 	// Create a valid image with a file.
-	srcFS := memfs.New()
-	require.NoError(t, srcFS.WriteFile("file.txt", []byte("data"), 0o644))
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	fileData := []byte("data")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "file.txt", Size: int64(len(fileData)), Mode: 0o644}))
+	_, err := tw.Write(fileData)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	imgFile, err := os.OpenFile(filepath.Join(t.TempDir(), "corrupt.img"), os.O_RDWR|os.O_CREATE, 0o644)
 	require.NoError(t, err)
@@ -669,8 +710,15 @@ func TestEROFSZeroModTimeCompactInode(t *testing.T) {
 	// time with a UTC Location (e.g. time.Time{}.UTC()). These are both
 	// IsZero() but not == time.Time{}. Previously the writer used == which
 	// would miss the UTC variant and produce an unnecessarily large inode.
-	srcFS := memfs.New()
-	require.NoError(t, srcFS.WriteFile("file.txt", []byte("hello"), 0o644))
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	helloContent := []byte("hello")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "file.txt", Size: int64(len(helloContent)), Mode: 0o644}))
+	_, err := tw.Write(helloContent)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	// Wrap to override ModTime with the UTC-located zero time.
 	wrapped := &zeroUTCModTimeFS{FS: srcFS}
@@ -792,11 +840,24 @@ func (c *countingFS) Lstat(name string) (fs.FileInfo, error) {
 func TestEROFSFileOpenedOnce(t *testing.T) {
 	// Verify that regular files are only opened once during Create,
 	// not twice (firstPass used to open files just to get their size).
-	srcFS := memfs.New()
-	require.NoError(t, srcFS.MkdirAll("dir", 0o755))
-	require.NoError(t, srcFS.WriteFile("dir/a.txt", []byte("aaa"), 0o644))
-	require.NoError(t, srcFS.WriteFile("dir/b.txt", []byte("bbb"), 0o644))
-	require.NoError(t, srcFS.WriteFile("big.txt", make([]byte, 8192), 0o644))
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "dir/", Mode: 0o755}))
+	aTxt := []byte("aaa")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/a.txt", Size: int64(len(aTxt)), Mode: 0o644}))
+	_, err := tw.Write(aTxt)
+	require.NoError(t, err)
+	bTxt := []byte("bbb")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "dir/b.txt", Size: int64(len(bTxt)), Mode: 0o644}))
+	_, err = tw.Write(bTxt)
+	require.NoError(t, err)
+	bigTxt := make([]byte, 8192)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "big.txt", Size: int64(len(bigTxt)), Mode: 0o644}))
+	_, err = tw.Write(bigTxt)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
+	require.NoError(t, err)
 
 	cfs := &countingFS{FS: srcFS, counts: make(map[string]int)}
 
