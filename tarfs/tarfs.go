@@ -536,6 +536,18 @@ func (fh *FileHeader) GetIno() uint64   { return fh.ino }
 func (fh *FileHeader) GetNlink() uint64 { return fh.nlink }
 func (fh *FileHeader) GetUID() int      { return fh.Header.Uid }
 func (fh *FileHeader) GetGID() int      { return fh.Header.Gid }
+func (fh *FileHeader) GetDevMajor() uint32 {
+	if fh.Header.Devmajor < 0 {
+		return 0
+	}
+	return uint32(fh.Header.Devmajor)
+}
+func (fh *FileHeader) GetDevMinor() uint32 {
+	if fh.Header.Devminor < 0 {
+		return 0
+	}
+	return uint32(fh.Header.Devminor)
+}
 
 // readerWithOffset is a wrapper around io.ReaderAt that keeps track of the current offset.
 type readerWithOffset struct {

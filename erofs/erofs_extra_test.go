@@ -341,3 +341,106 @@ func TestEROFSSetuidSetgidStickyRoundTrip(t *testing.T) {
 		"sticky bit should be preserved")
 	require.True(t, info.IsDir())
 }
+
+// TestEROFSSpecialFilesModeBits verifies that the mode bits of special files
+// (block device, char device, FIFO) survive a write→read round-trip.
+func TestEROFSSpecialFilesModeBits(t *testing.T) {
+	headers := []tar.Header{
+		{Typeflag: tar.TypeBlock, Name: "blkdev", Mode: 0o660, Devmajor: 8, Devminor: 1},
+		{Typeflag: tar.TypeChar, Name: "chrdev", Mode: 0o666, Devmajor: 5, Devminor: 1},
+		{Typeflag: tar.TypeFifo, Name: "fifo", Mode: 0o644},
+	}
+
+	tfs := createTarFS(t, headers, nil)
+	fsys := createImage(t, tfs)
+
+	t.Run("block device mode", func(t *testing.T) {
+		info, err := fsys.Lstat("blkdev")
+		require.NoError(t, err)
+		require.Equal(t, fs.ModeDevice, info.Mode().Type(),
+			"block device should have ModeDevice type")
+		require.Equal(t, fs.FileMode(0o660), info.Mode().Perm())
+	})
+
+	t.Run("char device mode", func(t *testing.T) {
+		info, err := fsys.Lstat("chrdev")
+		require.NoError(t, err)
+		require.Equal(t, fs.ModeDevice|fs.ModeCharDevice, info.Mode().Type(),
+			"char device should have ModeDevice|ModeCharDevice type")
+		require.Equal(t, fs.FileMode(0o666), info.Mode().Perm())
+	})
+
+	t.Run("fifo mode", func(t *testing.T) {
+		info, err := fsys.Lstat("fifo")
+		require.NoError(t, err)
+		require.Equal(t, fs.ModeNamedPipe, info.Mode().Type(),
+			"fifo should have ModeNamedPipe type")
+		require.Equal(t, fs.FileMode(0o644), info.Mode().Perm())
+	})
+}
+
+// TestEROFSDeviceNumbers verifies that major/minor device numbers are
+// preserved for block and character devices through a write→read round-trip.
+func TestEROFSDeviceNumbers(t *testing.T) {
+	tests := []struct {
+		name     string
+		typeflag byte
+		major    int64
+		minor    int64
+	}{
+		{"sda1 (block)", tar.TypeBlock, 8, 1},
+		{"sda (block)", tar.TypeBlock, 8, 0},
+		{"null (char)", tar.TypeChar, 1, 3},
+		{"zero (char)", tar.TypeChar, 1, 5},
+		{"large minor (block)", tar.TypeBlock, 8, 256},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := []tar.Header{
+				{Typeflag: tt.typeflag, Name: "dev", Mode: 0o660,
+					Devmajor: tt.major, Devminor: tt.minor},
+			}
+			tfs := createTarFS(t, headers, nil)
+			fsys := createImage(t, tfs)
+
+			info, err := fsys.Lstat("dev")
+			require.NoError(t, err)
+
+			ino, ok := info.Sys().(*erofs.Inode)
+			require.True(t, ok, "Sys() should return *erofs.Inode")
+
+			require.Equal(t, uint32(tt.major), ino.GetDevMajor(),
+				"major device number should be preserved")
+			require.Equal(t, uint32(tt.minor), ino.GetDevMinor(),
+				"minor device number should be preserved")
+		})
+	}
+}
+
+// TestEROFSSpecialFilesWithAdjacentFiles verifies that special files in
+// a filesystem with regular files do not corrupt the regular file data.
+func TestEROFSSpecialFilesWithAdjacentFiles(t *testing.T) {
+	headers := []tar.Header{
+		{Typeflag: tar.TypeReg, Name: "before.txt", Mode: 0o644},
+		{Typeflag: tar.TypeBlock, Name: "blkdev", Mode: 0o660, Devmajor: 8, Devminor: 1},
+		{Typeflag: tar.TypeChar, Name: "chrdev", Mode: 0o666, Devmajor: 1, Devminor: 3},
+		{Typeflag: tar.TypeFifo, Name: "fifo", Mode: 0o644},
+		{Typeflag: tar.TypeReg, Name: "after.txt", Mode: 0o644},
+	}
+	fileData := map[string][]byte{
+		"before.txt": []byte("before"),
+		"after.txt":  []byte("after"),
+	}
+
+	tfs := createTarFS(t, headers, fileData)
+	fsys := createImage(t, tfs)
+
+	got, err := fs.ReadFile(fsys, "before.txt")
+	require.NoError(t, err)
+	require.Equal(t, []byte("before"), got)
+
+	got, err = fs.ReadFile(fsys, "after.txt")
+	require.NoError(t, err)
+	require.Equal(t, []byte("after"), got)
+}

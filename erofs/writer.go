@@ -171,8 +171,10 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			if err != nil {
 				return metaSize, dataSize, fmt.Errorf("failed to get data for %q: %w", path, err)
 			}
-			if err := data.Close(); err != nil {
-				return metaSize, dataSize, fmt.Errorf("failed to close data for %q: %w", path, err)
+			if data != nil {
+				if err := data.Close(); err != nil {
+					return metaSize, dataSize, fmt.Errorf("failed to close data for %q: %w", path, err)
+				}
 			}
 			size = sz
 		}
@@ -206,6 +208,11 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Ino = nid
 				ino.Size = uint32(size)
 				shouldAllocate = true
+			} else if isSpecialFile(ino.Mode) {
+				// Device files, FIFOs, and sockets have no file data.
+				ino.Ino = nid
+				ino.Size = 0
+				rawBlockAssigned = true
 			} else {
 				// Handle all non-directory files with hardlink deduplication
 				fsys, ok := w.src.(fs.ReadLinkFS)
@@ -262,6 +269,13 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				ino.Ino = nid
 				ino.Size = uint64(size)
 				shouldAllocate = true
+			} else if isSpecialFile(ino.Mode) {
+				// Device files, FIFOs, and sockets have no file data. RawBlockAddr
+				// was set by toInode to the encoded device number and must not be
+				// overwritten here or adjusted in the fixup pass.
+				ino.Ino = nid
+				ino.Size = 0
+				rawBlockAssigned = true
 			} else {
 				// Handle all non-directory files with hardlink deduplication
 				fsys, ok := w.src.(fs.ReadLinkFS)
@@ -342,12 +356,20 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 		switch ino := ino.(type) {
 		case InodeCompact:
 			if !isInlined(ino) {
-				ino.RawBlockAddr += uint32(dataBlockAddr)
+				// Special files (devices, FIFOs, sockets) store a device number in
+				// RawBlockAddr, not a data block address; do not offset it.
+				if !isSpecialFile(ino.Mode) {
+					ino.RawBlockAddr += uint32(dataBlockAddr)
+				}
 				w.inodes[path] = ino
 			}
 		case InodeExtended:
 			if !isInlined(ino) {
-				ino.RawBlockAddr += uint32(dataBlockAddr)
+				// Special files (devices, FIFOs, sockets) store a device number in
+				// RawBlockAddr, not a data block address; do not offset it.
+				if !isSpecialFile(ino.Mode) {
+					ino.RawBlockAddr += uint32(dataBlockAddr)
+				}
 				w.inodes[path] = ino
 			}
 		default:
@@ -436,6 +458,9 @@ func (w *writer) writeData() error {
 		data, _, err := w.dataForInode(path, ino)
 		if err != nil {
 			return fmt.Errorf("failed to get data for %q: %w", path, err)
+		}
+		if data == nil {
+			continue
 		}
 
 		_, err = io.Copy(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data)
@@ -621,7 +646,9 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		return io.NopCloser(bytes.NewReader([]byte(target))), int64(len(target)), nil
 
-	// TODO: device files, named pipes, sockets, etc.
+	case S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK:
+		// Special files have no data.
+		return nil, 0, nil
 
 	default:
 		return nil, 0, fmt.Errorf("unsupported file type %o", mode&S_IFMT)
@@ -668,28 +695,40 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 		mode = mode&^fs.ModePerm | originalFInfo.Mode.Perm()
 	}
 
+	// For block and character devices, RawBlockAddr stores the encoded device
+	// number (EROFS new_encode_dev format). FIFOs and sockets use 0.
+	var rdev uint32
+	if modeType := mode.Type(); modeType&fs.ModeDevice != 0 {
+		rdev = encodeDeviceID(
+			archivefs.GetDevMajor(fi.Sys()),
+			archivefs.GetDevMinor(fi.Sys()),
+		)
+	}
+
 	compact := fi.Size() <= math.MaxUint32 &&
 		uid <= math.MaxUint16 && gid <= math.MaxUint16 &&
 		fi.ModTime().IsZero()
 
 	if compact {
 		return InodeCompact{
-			Format: setBits(0, InodeLayoutCompact, InodeLayoutBit, InodeLayoutBits),
-			Mode:   statModeFromFileMode(mode),
-			Nlink:  uint16(nlink),
-			UID:    uint16(uid),
-			GID:    uint16(gid),
+			Format:       setBits(0, InodeLayoutCompact, InodeLayoutBit, InodeLayoutBits),
+			Mode:         statModeFromFileMode(mode),
+			Nlink:        uint16(nlink),
+			UID:          uint16(uid),
+			GID:          uint16(gid),
+			RawBlockAddr: rdev,
 		}
 	}
 
 	return InodeExtended{
-		Format:    setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
-		Mode:      statModeFromFileMode(mode),
-		Nlink:     uint32(nlink),
-		UID:       uint32(uid),
-		GID:       uint32(gid),
-		Mtime:     uint64(fi.ModTime().Unix()),
-		MtimeNsec: uint32(fi.ModTime().Nanosecond()),
+		Format:       setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
+		Mode:         statModeFromFileMode(mode),
+		Nlink:        uint32(nlink),
+		UID:          uint32(uid),
+		GID:          uint32(gid),
+		Mtime:        uint64(fi.ModTime().Unix()),
+		MtimeNsec:    uint32(fi.ModTime().Nanosecond()),
+		RawBlockAddr: rdev,
 	}
 }
 
@@ -792,6 +831,28 @@ func isInlined(ino any) bool {
 	}
 
 	return bitRange(format, InodeDataLayoutBit, InodeDataLayoutBits) == InodeDataLayoutFlatInline
+}
+
+// isSpecialFile reports whether the inode mode represents a device file,
+// FIFO, or socket — file types that have no data blocks and whose RawBlockAddr
+// field holds a device number rather than a block address.
+func isSpecialFile(mode uint16) bool {
+	t := mode & S_IFMT
+	return t == S_IFBLK || t == S_IFCHR || t == S_IFIFO || t == S_IFSOCK
+}
+
+// encodeDeviceID encodes a major/minor device number pair into the 32-bit format
+// used by EROFS (equivalent to the kernel's new_encode_dev).
+func encodeDeviceID(major, minor uint32) uint32 {
+	return (minor & 0xff) | (major << 8) | ((minor &^ uint32(0xff)) << 12)
+}
+
+// decodeDeviceID decodes a 32-bit EROFS device number into its major and minor
+// components (equivalent to the kernel's new_decode_dev).
+func decodeDeviceID(dev uint32) (major, minor uint32) {
+	major = (dev & 0x000fff00) >> 8
+	minor = (dev & 0xff) | ((dev >> 12) & 0xfff00)
+	return
 }
 
 func setBits(value, newValue, bit, bits uint16) uint16 {
