@@ -121,3 +121,51 @@ func TestStatModeRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestEncodeDeviceID(t *testing.T) {
+	tests := []struct {
+		name  string
+		major uint32
+		minor uint32
+	}{
+		{"null device (0, 0)", 0, 0},
+		{"sda (8, 0)", 8, 0},
+		{"sda1 (8, 1)", 8, 1},
+		{"large minor (0, 256)", 0, 256},
+		{"large major (255, 0)", 255, 0},
+		{"both large (4095, 1048575)", 4095, 1048575},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := encodeDeviceID(tt.major, tt.minor)
+			gotMajor, gotMinor := decodeDeviceID(encoded)
+			if gotMajor != tt.major || gotMinor != tt.minor {
+				t.Errorf("encodeDeviceID(%d,%d)=0x%x; decodeDeviceID -> (%d,%d), want (%d,%d)",
+					tt.major, tt.minor, encoded, gotMajor, gotMinor, tt.major, tt.minor)
+			}
+		})
+	}
+}
+
+func TestIsSpecialFile(t *testing.T) {
+	tests := []struct {
+		name string
+		mode uint16
+		want bool
+	}{
+		{"regular", S_IFREG | 0o644, false},
+		{"directory", S_IFDIR | 0o755, false},
+		{"symlink", S_IFLNK | 0o777, false},
+		{"char device", S_IFCHR | 0o660, true},
+		{"block device", S_IFBLK | 0o660, true},
+		{"fifo", S_IFIFO | 0o644, true},
+		{"socket", S_IFSOCK | 0o600, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSpecialFile(tt.mode); got != tt.want {
+				t.Errorf("isSpecialFile(0o%o) = %v, want %v", tt.mode, got, tt.want)
+			}
+		})
+	}
+}

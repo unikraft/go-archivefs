@@ -28,3 +28,12 @@ type OwnerInfo interface {
 	// GetGID returns the group ID of the file owner.
 	GetGID() int
 }
+
+// DevInfo is implemented by FileInfo.Sys() values that expose device numbers
+// for special files (block/character devices).
+type DevInfo interface {
+	// GetDevMajor returns the major device number.
+	GetDevMajor() uint32
+	// GetDevMinor returns the minor device number.
+	GetDevMinor() uint32
+}

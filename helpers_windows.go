@@ -60,3 +60,35 @@ func GetGID(sys any) int {
 	}
 	return 0
 }
+
+// GetDevMajor returns the major device number from a FileInfo.Sys() value.
+// It supports *tar.Header and any type implementing [DevInfo].
+// Returns 0 for non-device files.
+func GetDevMajor(sys any) uint32 {
+	switch v := sys.(type) {
+	case DevInfo:
+		return v.GetDevMajor()
+	case *tar.Header:
+		if v.Devmajor < 0 {
+			return 0
+		}
+		return uint32(v.Devmajor)
+	}
+	return 0
+}
+
+// GetDevMinor returns the minor device number from a FileInfo.Sys() value.
+// It supports *tar.Header and any type implementing [DevInfo].
+// Returns 0 for non-device files.
+func GetDevMinor(sys any) uint32 {
+	switch v := sys.(type) {
+	case DevInfo:
+		return v.GetDevMinor()
+	case *tar.Header:
+		if v.Devminor < 0 {
+			return 0
+		}
+		return uint32(v.Devminor)
+	}
+	return 0
+}

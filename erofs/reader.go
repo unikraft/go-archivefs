@@ -431,7 +431,13 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 		fallthrough
 
 	case InodeDataLayoutFlatPlain:
-		inode.dataOff = i.sb.BlockAddrToOffset(rawBlockAddr)
+		if isSpecialFile(inode.mode) {
+			// For device files, FIFOs, and sockets, rawBlockAddr carries the
+			// encoded device number, not a data block address.
+			inode.rdev = rawBlockAddr
+		} else {
+			inode.dataOff = i.sb.BlockAddrToOffset(rawBlockAddr)
+		}
 
 	default:
 		return Inode{}, fmt.Errorf("unsupported data layout at inode %d", nid)
@@ -495,6 +501,10 @@ type Inode struct {
 	uid       uint32
 	gid       uint32
 	nlink     uint32
+
+	// rdev holds the EROFS-encoded device number (new_encode_dev) for block
+	// and character device inodes. Zero for all other file types.
+	rdev uint32
 }
 
 // bitRange returns the bits within the range [bit, bit+bits) in value.
@@ -628,6 +638,22 @@ func (ino *Inode) GetUID() int { return int(ino.UID()) }
 
 // GetGID implements [archivefs.OwnerInfo].
 func (ino *Inode) GetGID() int { return int(ino.GID()) }
+
+// Rdev returns the EROFS-encoded device number for block/character device
+// inodes. For all other file types the result is zero.
+func (ino *Inode) Rdev() uint32 { return ino.rdev }
+
+// GetDevMajor implements [archivefs.DevInfo].
+func (ino *Inode) GetDevMajor() uint32 {
+	major, _ := decodeDeviceID(ino.rdev)
+	return major
+}
+
+// GetDevMinor implements [archivefs.DevInfo].
+func (ino *Inode) GetDevMinor() uint32 {
+	_, minor := decodeDeviceID(ino.rdev)
+	return minor
+}
 
 // Data returns the read-only file data of this inode.
 func (ino *Inode) Data() (io.Reader, error) {
