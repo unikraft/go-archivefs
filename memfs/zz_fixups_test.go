@@ -162,3 +162,17 @@ func TestNewCreationSetsModTime(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, li.ModTime().IsZero(), "symlink modTime is zero")
 }
+
+// WriteFile must preserve the permissions of an existing file rather
+// than overwriting them, matching its documented behaviour and
+// os.WriteFile (fix #7).
+func TestNewWriteFilePreservesExistingPerm(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.WriteFile("f", []byte("a"), 0o600))
+
+	require.NoError(t, rootFS.WriteFile("f", []byte("bb"), 0o777))
+
+	fi, err := rootFS.Lstat("f")
+	require.NoError(t, err)
+	require.Equal(t, fs.FileMode(0o600), fi.Mode().Perm(), "existing file perms changed")
+}

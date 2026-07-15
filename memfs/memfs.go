@@ -295,13 +295,25 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		path = ""
 	}
 
+	// Determine whether the target file already exists so the documented
+	// behaviour is honoured: perm is applied only on creation, and an
+	// existing file keeps its permissions.
+	existed := false
+	if existing, err := rootFS.resolve(path, false); err == nil {
+		if _, ok := existing.(*File); ok {
+			existed = true
+		}
+	}
+
 	f, err := rootFS.create(path)
 	if err != nil {
 		return err
 	}
 	f.content = bytes.NewBuffer(data)
 	f.size = int64(len(data))
-	f.perm = perm
+	if !existed {
+		f.perm = perm
+	}
 	return nil
 }
 
