@@ -1,8 +1,8 @@
 package memfs_test
 
 import (
-	"fmt"
 	"errors"
+	"fmt"
 	"io/fs"
 	"syscall"
 	"testing"
@@ -207,4 +207,26 @@ func TestNewSubDotReturnsRoot(t *testing.T) {
 	got, err := fs.ReadFile(sub, "file")
 	require.NoError(t, err)
 	require.Equal(t, []byte("x"), got)
+}
+
+// The iterative resolver must handle relative symlink targets that use
+// ".." (regression guard for the iterative rewrite, fix #10).
+func TestNewResolveRelativeDotDot(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.MkdirAll("dir1", 0o755))
+	require.NoError(t, rootFS.MkdirAll("dir2", 0o755))
+	require.NoError(t, rootFS.WriteFile("dir1/file.txt", []byte("relative"), 0o644))
+	require.NoError(t, rootFS.Symlink("../dir1/file.txt", "dir2/link.txt"))
+
+	got, err := fs.ReadFile(rootFS, "dir2/link.txt")
+	require.NoError(t, err)
+	require.Equal(t, []byte("relative"), got)
+
+	// A relative chain that stays within the root.
+	require.NoError(t, rootFS.MkdirAll("a/b", 0o755))
+	require.NoError(t, rootFS.WriteFile("a/b/leaf", []byte("deep"), 0o644))
+	require.NoError(t, rootFS.Symlink("../a/b/leaf", "dir1/relchain"))
+	got2, err := fs.ReadFile(rootFS, "dir1/relchain")
+	require.NoError(t, err)
+	require.Equal(t, []byte("deep"), got2)
 }

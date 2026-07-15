@@ -135,6 +135,8 @@ func (rootFS *FS) resolve(name string, noFollowLast bool) (childI, error) {
 	return rootFS.resolveDepth(name, noFollowLast, maxSymlinks)
 }
 
+// resolveDepth resolves name within the filesystem, following symlinks
+// It is iterative.
 func (rootFS *FS) resolveDepth(name string, noFollowLast bool, remaining int) (childI, error) {
 	if name == "." {
 		name = ""
@@ -143,10 +145,16 @@ func (rootFS *FS) resolveDepth(name string, noFollowLast bool, remaining int) (c
 		return rootFS.dir, nil
 	}
 
-	components := strings.Split(name, "/")
+	// pending is the worklist of components still to resolve, front first.
+	pending := strings.Split(name, "/")
 	cur := rootFS.dir
+	var curPath string // path from root to cur, "" at the root
 
-	for i, comp := range components {
+	for len(pending) > 0 {
+		comp := pending[0]
+		pending = pending[1:]
+		isLast := len(pending) == 0
+
 		cur.mu.Lock()
 		child := cur.children[comp]
 		cur.mu.Unlock()
@@ -154,8 +162,6 @@ func (rootFS *FS) resolveDepth(name string, noFollowLast bool, remaining int) (c
 		if child == nil {
 			return nil, fmt.Errorf("no such file or directory: %s: %w", comp, fs.ErrNotExist)
 		}
-
-		isLast := i == len(components)-1
 
 		switch c := child.(type) {
 		case *symlink:
@@ -165,29 +171,32 @@ func (rootFS *FS) resolveDepth(name string, noFollowLast bool, remaining int) (c
 			if remaining <= 0 {
 				return nil, fmt.Errorf("too many levels of symbolic links: %w", syscall.ELOOP)
 			}
+			remaining--
 
 			target := c.target
 			if !strings.HasPrefix(target, "/") {
-				// Relative: join with parent path.
-				if i > 0 {
-					parentPath := strings.Join(components[:i], "/")
-					target = parentPath + "/" + target
+				if curPath != "" {
+					target = curPath + "/" + target
 				}
 			}
-			// Append remaining unresolved components.
-			if !isLast {
-				rest := strings.Join(components[i+1:], "/")
-				target = target + "/" + rest
-			}
+			target = strings.TrimLeft(target, "/")
 			target = syspath.Clean(target)
 			if target == "." {
 				target = ""
 			}
-			target = strings.TrimLeft(target, "/")
-			return rootFS.resolveDepth(target, noFollowLast, remaining-1)
+			cur = rootFS.dir
+			curPath = ""
+			if target != "" {
+				pending = append(strings.Split(target, "/"), pending...)
+			}
 
 		case *dir:
 			cur = c
+			if curPath == "" {
+				curPath = comp
+			} else {
+				curPath = curPath + "/" + comp
+			}
 
 		case *File:
 			if isLast {
