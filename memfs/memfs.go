@@ -136,6 +136,9 @@ func (rootFS *FS) resolve(name string, noFollowLast bool) (childI, error) {
 }
 
 func (rootFS *FS) resolveDepth(name string, noFollowLast bool, remaining int) (childI, error) {
+	if name == "." {
+		name = ""
+	}
 	if name == "" {
 		return rootFS.dir, nil
 	}

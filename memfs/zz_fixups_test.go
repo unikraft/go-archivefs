@@ -195,3 +195,16 @@ func TestNewOpenReturnsPathError(t *testing.T) {
 	_, err = rootFS.Sub("missing")
 	require.ErrorAs(t, err, &pe, "Sub must return *fs.PathError")
 }
+
+// Sub(".") must return a filesystem rooted at the current root, matching
+// Open(".")'s treatment of "." as the root (fix #13).
+func TestNewSubDotReturnsRoot(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.WriteFile("file", []byte("x"), 0o644))
+
+	sub, err := rootFS.Sub(".")
+	require.NoError(t, err)
+	got, err := fs.ReadFile(sub, "file")
+	require.NoError(t, err)
+	require.Equal(t, []byte("x"), got)
+}
