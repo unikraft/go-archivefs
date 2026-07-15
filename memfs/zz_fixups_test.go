@@ -141,3 +141,24 @@ func TestFixupLstatRootName(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ".", sfi.Name())
 }
+
+// Newly created files and directories must report a non-zero ModTime so
+// consumers don't see the year-1 zero timestamp (fix #8).
+func TestNewCreationSetsModTime(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.MkdirAll("dir", 0o755))
+	require.NoError(t, rootFS.WriteFile("file", []byte("x"), 0o644))
+	require.NoError(t, rootFS.Symlink("file", "link"))
+
+	di, err := rootFS.Lstat("dir")
+	require.NoError(t, err)
+	require.False(t, di.ModTime().IsZero(), "directory modTime is zero")
+
+	fi, err := rootFS.Lstat("file")
+	require.NoError(t, err)
+	require.False(t, fi.ModTime().IsZero(), "file modTime is zero")
+
+	li, err := rootFS.Lstat("link")
+	require.NoError(t, err)
+	require.False(t, li.ModTime().IsZero(), "symlink modTime is zero")
+}

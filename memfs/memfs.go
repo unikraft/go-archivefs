@@ -99,6 +99,7 @@ func (rootFS *FS) MkdirAll(path string, perm os.FileMode) error {
 			next = &dir{
 				name:     part,
 				perm:     perm,
+				modTime:  time.Now(),
 				children: make(map[string]childI),
 			}
 			cur.children[part] = next
@@ -273,6 +274,7 @@ func (rootFS *FS) create(path string) (*File, error) {
 	newFile := &File{
 		name:    filePart,
 		perm:    0666,
+		modTime: time.Now(),
 		content: &bytes.Buffer{},
 	}
 	parent.children[filePart] = newFile
