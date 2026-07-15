@@ -176,3 +176,22 @@ func TestNewWriteFilePreservesExistingPerm(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, fs.FileMode(0o600), fi.Mode().Perm(), "existing file perms changed")
 }
+
+// Open of a missing file must return a *fs.PathError (per the io/fs
+// contract) while still being errors.Is-detectable as ErrNotExist (fix #6).
+func TestNewOpenReturnsPathError(t *testing.T) {
+	rootFS := memfs.New()
+
+	_, err := rootFS.Open("missing")
+	require.Error(t, err)
+	var pe *fs.PathError
+	require.ErrorAs(t, err, &pe, "Open must return *fs.PathError")
+	require.ErrorIs(t, err, fs.ErrNotExist)
+
+	// fs.Stat / fs.ReadFile go through Open and should surface the same shape.
+	_, err = fs.Stat(rootFS, "missing")
+	require.ErrorAs(t, err, &pe)
+
+	_, err = rootFS.Sub("missing")
+	require.ErrorAs(t, err, &pe, "Sub must return *fs.PathError")
+}

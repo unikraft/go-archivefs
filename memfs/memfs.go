@@ -335,7 +335,7 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 
 	child, err := rootFS.get(name)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 	}
 
 	switch cc := child.(type) {
@@ -366,7 +366,7 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 func (rootFS *FS) Sub(path string) (fs.FS, error) {
 	dir, err := rootFS.getDir(path)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "sub", Path: path, Err: err}
 	}
 	return &FS{dir: dir}, nil
 }
