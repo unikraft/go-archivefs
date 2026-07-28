@@ -41,11 +41,13 @@
 package memfs_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/unikraft/go-archivefs/memfs"
@@ -137,6 +139,14 @@ func TestMemFSRootStatName(t *testing.T) {
 	require.Equal(t, ".", sfi.Name(), "Sub-FS root Stat().Name() should be \".\"")
 	require.True(t, sfi.IsDir())
 	require.NoError(t, sf.Close())
+
+	fi, err = rootFS.Lstat(".")
+	require.NoError(t, err)
+	require.Equal(t, ".", fi.Name())
+
+	fi, err = subFS.(*memfs.FS).Lstat(".")
+	require.NoError(t, err)
+	require.Equal(t, ".", fi.Name())
 }
 
 func TestMemFSDirEntryType(t *testing.T) {
@@ -301,8 +311,8 @@ func TestMemFSSymlinkCycleDetection(t *testing.T) {
 	require.NoError(t, rootFS.Symlink("a", "b"))
 
 	_, err := rootFS.Open("a")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "too many levels of symbolic links")
+	require.ErrorIs(t, err, syscall.ELOOP)
+	require.False(t, errors.Is(err, fs.ErrNotExist), "loop should not be reported as ErrNotExist")
 }
 
 func TestMemFSSymlinkRelative(t *testing.T) {
@@ -317,6 +327,14 @@ func TestMemFSSymlinkRelative(t *testing.T) {
 	got, err := fs.ReadFile(rootFS, "dir2/link.txt")
 	require.NoError(t, err)
 	require.Equal(t, []byte("relative"), got)
+
+	// Relative symlink chains must continue resolving after handling "..".
+	require.NoError(t, rootFS.MkdirAll("a/b", 0o755))
+	require.NoError(t, rootFS.WriteFile("a/b/leaf", []byte("deep"), 0o644))
+	require.NoError(t, rootFS.Symlink("../a/b/leaf", "dir1/relchain"))
+	got, err = fs.ReadFile(rootFS, "dir1/relchain")
+	require.NoError(t, err)
+	require.Equal(t, []byte("deep"), got)
 }
 
 func TestMemFSReadLink(t *testing.T) {
@@ -490,6 +508,12 @@ func TestMemFSSymlinkAbsolute(t *testing.T) {
 	got, err := fs.ReadFile(rootFS, "shortcut/file.txt")
 	require.NoError(t, err)
 	require.Equal(t, []byte("abs"), got)
+
+	// Leading and internal slashes are normalized relative to the root.
+	require.NoError(t, rootFS.Symlink("//deep//nested", "extra-shortcut"))
+	got, err = fs.ReadFile(rootFS, "extra-shortcut/file.txt")
+	require.NoError(t, err)
+	require.Equal(t, []byte("abs"), got)
 }
 
 func TestMemFSSymlinkLstatRoot(t *testing.T) {
@@ -535,4 +559,114 @@ func TestMemFSSymlinkMaxDepth(t *testing.T) {
 	_, err = rootFS.Open("s_extra")
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "too many levels of symbolic links"))
+}
+
+func TestMemFSMkdirAllConcurrentOverlap(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.MkdirAll("shared", 0o755))
+
+	const goroutines = 20
+	const iterations = 200
+	done := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			for n := 0; n < iterations; n++ {
+				if err := rootFS.MkdirAll("shared/deep/common", 0o755); err != nil {
+					done <- err
+					return
+				}
+				if err := rootFS.MkdirAll(fmt.Sprintf("shared/g%d/leaf", g), 0o755); err != nil {
+					done <- err
+					return
+				}
+			}
+			done <- nil
+		}()
+	}
+	for g := 0; g < goroutines; g++ {
+		require.NoError(t, <-done)
+	}
+
+	for g := 0; g < goroutines; g++ {
+		fi, err := fs.Stat(rootFS, fmt.Sprintf("shared/g%d/leaf", g))
+		require.NoError(t, err, "goroutine %d leaf missing", g)
+		require.True(t, fi.IsDir())
+	}
+}
+
+func TestMemFSWriteFileThroughDanglingSymlink(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.Symlink("nonexistent", "link"))
+	require.NoError(t, rootFS.WriteFile("link", []byte("data"), 0o644))
+
+	got, err := fs.ReadFile(rootFS, "nonexistent")
+	require.NoError(t, err)
+	require.Equal(t, []byte("data"), got)
+	got, err = fs.ReadFile(rootFS, "link")
+	require.NoError(t, err)
+	require.Equal(t, []byte("data"), got)
+
+	require.NoError(t, rootFS.MkdirAll("dir", 0o755))
+	require.NoError(t, rootFS.Symlink("inside", "dir/rel"))
+	require.NoError(t, rootFS.WriteFile("dir/rel", []byte("rel"), 0o644))
+	got, err = fs.ReadFile(rootFS, "dir/inside")
+	require.NoError(t, err)
+	require.Equal(t, []byte("rel"), got)
+}
+
+func TestMemFSWriteFileSymlinkMissingParent(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.Symlink("missing/child", "link"))
+
+	err := rootFS.WriteFile("link", []byte("x"), 0o644)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+}
+
+func TestMemFSCreationSetsModTime(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.MkdirAll("dir", 0o755))
+	require.NoError(t, rootFS.WriteFile("file", []byte("x"), 0o644))
+	require.NoError(t, rootFS.Symlink("file", "link"))
+
+	for _, name := range []string{"dir", "file", "link"} {
+		fi, err := rootFS.Lstat(name)
+		require.NoError(t, err)
+		require.False(t, fi.ModTime().IsZero(), "%s modTime is zero", name)
+	}
+}
+
+func TestMemFSWriteFilePreservesExistingPerm(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.WriteFile("f", []byte("a"), 0o600))
+	require.NoError(t, rootFS.WriteFile("f", []byte("bb"), 0o777))
+
+	fi, err := rootFS.Lstat("f")
+	require.NoError(t, err)
+	require.Equal(t, fs.FileMode(0o600), fi.Mode().Perm())
+}
+
+func TestMemFSOpenReturnsPathError(t *testing.T) {
+	rootFS := memfs.New()
+	var pe *fs.PathError
+
+	_, err := rootFS.Open("missing")
+	require.ErrorAs(t, err, &pe)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+
+	_, err = fs.Stat(rootFS, "missing")
+	require.ErrorAs(t, err, &pe)
+	_, err = rootFS.Sub("missing")
+	require.ErrorAs(t, err, &pe)
+}
+
+func TestMemFSSubDotReturnsRoot(t *testing.T) {
+	rootFS := memfs.New()
+	require.NoError(t, rootFS.WriteFile("file", []byte("x"), 0o644))
+
+	sub, err := rootFS.Sub(".")
+	require.NoError(t, err)
+	got, err := fs.ReadFile(sub, "file")
+	require.NoError(t, err)
+	require.Equal(t, []byte("x"), got)
 }
