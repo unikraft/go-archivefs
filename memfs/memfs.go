@@ -44,11 +44,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	syspath "path"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -86,107 +89,143 @@ func (rootFS *FS) MkdirAll(path string, perm os.FileMode) error {
 
 	parts := strings.Split(path, "/")
 
-	next := rootFS.dir
-	for _, part := range parts {
-		cur := next
-		cur.mu.Lock()
+	// Descend the tree holding the child's lock before releasing the parent's
+	cur := rootFS.dir
+	cur.mu.Lock()
+	for i, part := range parts {
 		child := cur.children[part]
+		var next *dir
 		if child == nil {
-			newDir := &dir{
+			next = &dir{
 				name:     part,
 				perm:     perm,
+				modTime:  time.Now(),
 				children: make(map[string]childI),
 			}
-			cur.children[part] = newDir
-			next = newDir
-		} else {
-			childDir, ok := child.(*dir)
+			cur.children[part] = next
+		} else if childDir, ok := child.(*dir); ok {
+			next = childDir
+		} else if _, ok := child.(*symlink); ok {
+			cur.mu.Unlock()
+			resolved, err := rootFS.resolve(strings.Join(parts[:i+1], "/"), false)
+			if err != nil {
+				return err
+			}
+			d, ok := resolved.(*dir)
 			if !ok {
 				return fmt.Errorf("not a directory: %s: %w", part, fs.ErrInvalid)
 			}
-			next = childDir
+			cur = d
+			cur.mu.Lock()
+			continue
+		} else {
+			cur.mu.Unlock()
+			return fmt.Errorf("not a directory: %s: %w", part, fs.ErrInvalid)
 		}
+		next.mu.Lock()
 		cur.mu.Unlock()
+		cur = next
 	}
+	cur.mu.Unlock()
 
 	return nil
 }
 
-func (rootFS *FS) getDir(path string) (*dir, error) {
-	if path == "" {
+func (rootFS *FS) resolve(name string, noFollowLast bool) (childI, error) {
+	return rootFS.resolveDepth(name, noFollowLast, maxSymlinks)
+}
+
+// resolveDepth resolves name within the filesystem, following symlinks
+// It is iterative.
+func (rootFS *FS) resolveDepth(name string, noFollowLast bool, remaining int) (childI, error) {
+	if name == "." {
+		name = ""
+	}
+	if name == "" {
 		return rootFS.dir, nil
 	}
-	parts := strings.Split(path, "/")
 
+	// pending is the worklist of components still to resolve, front first.
+	pending := strings.Split(name, "/")
 	cur := rootFS.dir
-	for _, part := range parts {
-		err := func() error {
-			cur.mu.Lock()
-			defer cur.mu.Unlock()
-			child := cur.children[part]
-			if child == nil {
-				return fmt.Errorf("not a directory: %s: %w", part, fs.ErrNotExist)
-			} else {
-				childDir, ok := child.(*dir)
-				if !ok {
-					return fmt.Errorf("no such file or directory: %s: %w", part, fs.ErrNotExist)
-				}
-				cur = childDir
+	var curPath string // path from root to cur, "" at the root
+
+	for len(pending) > 0 {
+		comp := pending[0]
+		pending = pending[1:]
+		isLast := len(pending) == 0
+
+		cur.mu.Lock()
+		child := cur.children[comp]
+		cur.mu.Unlock()
+
+		if child == nil {
+			return nil, fmt.Errorf("no such file or directory: %s: %w", comp, fs.ErrNotExist)
+		}
+
+		switch c := child.(type) {
+		case *symlink:
+			if noFollowLast && isLast {
+				return c, nil
 			}
-			return nil
-		}()
-		if err != nil {
-			return nil, err
+			if remaining <= 0 {
+				return nil, fmt.Errorf("too many levels of symbolic links: %w", syscall.ELOOP)
+			}
+			remaining--
+
+			target := c.target
+			if !strings.HasPrefix(target, "/") {
+				if curPath != "" {
+					target = curPath + "/" + target
+				}
+			}
+			target = strings.TrimLeft(target, "/")
+			target = syspath.Clean(target)
+			if target == "." {
+				target = ""
+			}
+			cur = rootFS.dir
+			curPath = ""
+			if target != "" {
+				pending = append(strings.Split(target, "/"), pending...)
+			}
+
+		case *dir:
+			cur = c
+			if curPath == "" {
+				curPath = comp
+			} else {
+				curPath = curPath + "/" + comp
+			}
+
+		case *File:
+			if isLast {
+				return c, nil
+			}
+			return nil, fmt.Errorf("not a directory: %s: %w", comp, fs.ErrNotExist)
+
+		default:
+			return nil, fmt.Errorf("unexpected file type: %s: %w", comp, fs.ErrInvalid)
 		}
 	}
 
 	return cur, nil
 }
 
+func (rootFS *FS) getDir(path string) (*dir, error) {
+	child, err := rootFS.resolve(path, false)
+	if err != nil {
+		return nil, err
+	}
+	d, ok := child.(*dir)
+	if !ok {
+		return nil, fmt.Errorf("not a directory: %s: %w", path, fs.ErrInvalid)
+	}
+	return d, nil
+}
+
 func (rootFS *FS) get(path string) (childI, error) {
-	if path == "" {
-		return rootFS.dir, nil
-	}
-
-	parts := strings.Split(path, "/")
-
-	var (
-		cur = rootFS.dir
-
-		chld childI
-		err  error
-	)
-	for i, part := range parts {
-		chld, err = func() (childI, error) {
-			cur.mu.Lock()
-			defer cur.mu.Unlock()
-			child := cur.children[part]
-			if child == nil {
-				return nil, fmt.Errorf("not a directory: %s: %w", part, fs.ErrNotExist)
-			} else {
-				_, isFile := child.(*File)
-				if isFile {
-					if i == len(parts)-1 {
-						return child, nil
-					} else {
-						return nil, fmt.Errorf("no such file or directory: %s: %w", part, fs.ErrNotExist)
-					}
-				}
-
-				childDir, ok := child.(*dir)
-				if !ok {
-					return nil, errors.New("not a directory")
-				}
-				cur = childDir
-			}
-			return child, nil
-		}()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return chld, nil
+	return rootFS.resolve(path, false)
 }
 
 func (rootFS *FS) create(path string) (*File, error) {
@@ -195,34 +234,62 @@ func (rootFS *FS) create(path string) (*File, error) {
 	}
 
 	if path == "." {
-		// root dir
 		path = ""
 	}
 
-	dirPart, filePart := syspath.Split(path)
+	// Resolve the full path (following all symlinks). If it resolves
+	// to an existing File we can overwrite it directly.
+	existing, err := rootFS.resolve(path, false)
+	if err == nil {
+		if f, ok := existing.(*File); ok {
+			return f, nil
+		}
+		return nil, fmt.Errorf("path is a directory: %s: %w", path, fs.ErrExist)
+	}
 
+	// The full path did not resolve. If the leaf is a (possibly
+	// dangling) symlink, follow OS semantics and create/truncate the
+	// link's target instead of erroring out.
+	if leaf, lerr := rootFS.resolve(path, true); lerr == nil {
+		if sl, ok := leaf.(*symlink); ok {
+			target := sl.target
+			if !strings.HasPrefix(target, "/") {
+				target = syspath.Join(syspath.Dir(path), target)
+			} else {
+				target = strings.TrimLeft(target, "/")
+			}
+			return rootFS.create(target)
+		}
+	}
+
+	// The path doesn't fully exist. Resolve the parent directory
+	// (following symlinks) and create the file there.
+	dirPart, filePart := syspath.Split(path)
 	dirPart = strings.TrimSuffix(dirPart, "/")
-	dir, err := rootFS.getDir(dirPart)
+
+	parent, err := rootFS.getDir(dirPart)
 	if err != nil {
 		return nil, err
 	}
 
-	dir.mu.Lock()
-	defer dir.mu.Unlock()
-	existing := dir.children[filePart]
-	if existing != nil {
-		_, ok := existing.(*File)
-		if !ok {
-			return nil, fmt.Errorf("path is a directory: %s: %w", path, fs.ErrExist)
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	// Double-check: another goroutine may have created it.
+	if child := parent.children[filePart]; child != nil {
+		if f, ok := child.(*File); ok {
+			return f, nil
 		}
+		return nil, fmt.Errorf("path already exists: %s: %w", path, fs.ErrExist)
 	}
 
 	newFile := &File{
 		name:    filePart,
 		perm:    0666,
+		modTime: time.Now(),
 		content: &bytes.Buffer{},
 	}
-	dir.children[filePart] = newFile
+	parent.children[filePart] = newFile
 
 	return newFile, nil
 }
@@ -240,12 +307,25 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		path = ""
 	}
 
+	// Determine whether the target file already exists so the documented
+	// behaviour is honoured: perm is applied only on creation, and an
+	// existing file keeps its permissions.
+	existed := false
+	if existing, err := rootFS.resolve(path, false); err == nil {
+		if _, ok := existing.(*File); ok {
+			existed = true
+		}
+	}
+
 	f, err := rootFS.create(path)
 	if err != nil {
 		return err
 	}
 	f.content = bytes.NewBuffer(data)
-	f.perm = perm
+	f.size = int64(len(data))
+	if !existed {
+		f.perm = perm
+	}
 	return nil
 }
 
@@ -259,14 +339,15 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 		}
 	}
 
-	if name == "." {
+	isRoot := name == "."
+	if isRoot {
 		// root dir
 		name = ""
 	}
 
 	child, err := rootFS.get(name)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 	}
 
 	switch cc := child.(type) {
@@ -274,12 +355,18 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 		handle := &File{
 			name:    cc.name,
 			perm:    cc.perm,
+			size:    int64(cc.content.Len()),
 			content: bytes.NewBuffer(cc.content.Bytes()),
 		}
 		return handle, nil
 	case *dir:
+		dirName := cc.name
+		if isRoot {
+			dirName = "."
+		}
 		handle := &fhDir{
-			dir: cc,
+			dir:  cc,
+			name: dirName,
 		}
 		return handle, nil
 	}
@@ -291,9 +378,115 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 func (rootFS *FS) Sub(path string) (fs.FS, error) {
 	dir, err := rootFS.getDir(path)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "sub", Path: path, Err: err}
 	}
 	return &FS{dir: dir}, nil
+}
+
+// Symlink creates a symbolic link at newname pointing to oldname.
+// The oldname target is stored verbatim and is not validated or resolved.
+// The newname must not be "." (the root), since a link cannot replace the
+// root directory; an attempt to do so returns an error wrapping fs.ErrInvalid.
+func (rootFS *FS) Symlink(oldname, newname string) error {
+	if !fs.ValidPath(newname) {
+		return &fs.PathError{Op: "symlink", Path: newname, Err: fs.ErrInvalid}
+	}
+	if newname == "." {
+		return &fs.PathError{Op: "symlink", Path: newname, Err: fs.ErrInvalid}
+	}
+
+	dirPart, filePart := syspath.Split(newname)
+	dirPart = strings.TrimSuffix(dirPart, "/")
+
+	parent, err := rootFS.getDir(dirPart)
+	if err != nil {
+		return err
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	if parent.children[filePart] != nil {
+		return &fs.PathError{Op: "symlink", Path: newname, Err: fs.ErrExist}
+	}
+
+	parent.children[filePart] = &symlink{
+		name:    filePart,
+		target:  oldname,
+		perm:    fs.ModeSymlink | 0o777,
+		modTime: time.Now(),
+	}
+	return nil
+}
+
+// ReadLink returns the destination of the named symbolic link.
+// The name must refer to a symbolic link: "." (the root directory) is not a
+// link and returns an error wrapping fs.ErrInvalid.
+func (rootFS *FS) ReadLink(name string) (string, error) {
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+	if name == "." {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+
+	child, err := rootFS.resolve(name, true)
+	if err != nil {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: err}
+	}
+
+	sl, ok := child.(*symlink)
+	if !ok {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
+	}
+
+	return sl.target, nil
+}
+
+// Lstat returns a FileInfo describing the named file without following symlinks.
+// Unlike Symlink and ReadLink, "." is a valid argument and describes the root
+// directory (reporting Name() == "."), consistent with Open(".").Stat().
+func (rootFS *FS) Lstat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrInvalid}
+	}
+
+	isRoot := name == "."
+	n := name
+	if isRoot {
+		n = ""
+	}
+
+	child, err := rootFS.resolve(n, true)
+	if err != nil {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: err}
+	}
+
+	fi, err := childFileInfo(child)
+	if err != nil {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: err}
+	}
+	if isRoot {
+		fi.name = "."
+	}
+	return fi, nil
+}
+
+// StatLink returns a FileInfo describing the file without following symbolic links.
+func (rootFS *FS) StatLink(name string) (fs.FileInfo, error) {
+	return rootFS.Lstat(name)
+}
+
+func childFileInfo(c childI) (*fileInfo, error) {
+	switch v := c.(type) {
+	case *File:
+		return &fileInfo{name: v.name, size: v.size, modTime: v.modTime, mode: v.perm}, nil
+	case *dir:
+		return &fileInfo{name: v.name, size: 4096, modTime: v.modTime, mode: v.perm | fs.ModeDir}, nil
+	case *symlink:
+		return &fileInfo{name: v.name, size: int64(len(v.target)), modTime: v.modTime, mode: v.perm}, nil
+	}
+	return nil, fs.ErrInvalid
 }
 
 type dir struct {
@@ -305,13 +498,14 @@ type dir struct {
 }
 
 type fhDir struct {
-	dir *dir
-	idx int
+	dir  *dir
+	name string
+	idx  int
 }
 
 func (d *fhDir) Stat() (fs.FileInfo, error) {
 	fi := fileInfo{
-		name:    d.dir.name,
+		name:    d.name,
 		size:    4096,
 		modTime: d.dir.modTime,
 		mode:    d.dir.perm | fs.ModeDir,
@@ -335,44 +529,50 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 	for name := range d.dir.children {
 		names = append(names, name)
 	}
+	slices.Sort(names)
 
-	if n <= 0 {
-		n = len(names)
+	remaining := len(names) - d.idx
+	if n > 0 && remaining == 0 {
+		return nil, io.EOF
+	}
+	if n <= 0 || n > remaining {
+		n = remaining
 	}
 
 	out := make([]fs.DirEntry, 0, n)
-
-	for i := d.idx; i < n && i < len(names); i++ {
-		name := names[i]
+	for _, name := range names[d.idx : d.idx+n] {
 		child := d.dir.children[name]
 
-		f, isFile := child.(*File)
-		if isFile {
-			stat, _ := f.Stat()
-			out = append(out, &dirEntry{
-				info: stat,
-			})
-		} else {
-			d := child.(*dir)
+		switch c := child.(type) {
+		case *File:
+			stat, _ := c.Stat()
+			out = append(out, &dirEntry{info: stat})
+		case *dir:
 			fi := fileInfo{
-				name:    d.name,
+				name:    c.name,
 				size:    4096,
-				modTime: d.modTime,
-				mode:    d.perm | fs.ModeDir,
+				modTime: c.modTime,
+				mode:    c.perm | fs.ModeDir,
 			}
-			out = append(out, &dirEntry{
-				info: &fi,
-			})
+			out = append(out, &dirEntry{info: &fi})
+		case *symlink:
+			fi := fileInfo{
+				name:    c.name,
+				size:    int64(len(c.target)),
+				modTime: c.modTime,
+				mode:    c.perm,
+			}
+			out = append(out, &dirEntry{info: &fi})
 		}
-
-		d.idx = i
 	}
+	d.idx += n
 	return out, nil
 }
 
 type File struct {
 	name    string
 	perm    os.FileMode
+	size    int64
 	content *bytes.Buffer
 	modTime time.Time
 	closed  bool
@@ -384,7 +584,7 @@ func (f *File) Stat() (fs.FileInfo, error) {
 	}
 	fi := fileInfo{
 		name:    f.name,
-		size:    int64(f.content.Len()),
+		size:    f.size,
 		modTime: f.modTime,
 		mode:    f.perm,
 	}
@@ -406,8 +606,18 @@ func (f *File) Close() error {
 	return nil
 }
 
-type childI interface {
+type childI interface{}
+
+type symlink struct {
+	name    string
+	target  string
+	perm    os.FileMode
+	modTime time.Time
 }
+
+// maxSymlinks is the maximum number of symlink resolutions allowed during
+// a single path resolution, matching the Linux kernel limit (MAXSYMLINKS).
+const maxSymlinks = 40
 
 type fileInfo struct {
 	name    string
@@ -459,7 +669,7 @@ func (de *dirEntry) IsDir() bool {
 }
 
 func (de *dirEntry) Type() fs.FileMode {
-	return de.info.Mode()
+	return de.info.Mode().Type()
 }
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
