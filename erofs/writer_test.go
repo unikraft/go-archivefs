@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -787,4 +788,89 @@ func TestWriterMultipleWrites(t *testing.T) {
 
 		f.Close()
 	}
+}
+
+// TestWriterDaxSafeInlining verifies the data layout policy: regular file
+// data is never inlined (DAX requires block-aligned file data), while
+// directory and symlink data is inlined when it fits (fully inline below one
+// block, tail-packed above), matching mkfs.erofs behavior.
+func TestWriterDaxSafeInlining(t *testing.T) {
+	testFS := fstest.MapFS{
+		"small.txt": &fstest.MapFile{
+			Data:    []byte("small file data"),
+			Mode:    0o644,
+			ModTime: time.Unix(1234567890, 0),
+		},
+		"tail.bin": &fstest.MapFile{
+			Data:    make([]byte, 5000), // one block + tail
+			Mode:    0o644,
+			ModTime: time.Unix(1234567890, 0),
+		},
+		"dir/file.txt": &fstest.MapFile{
+			Data:    []byte("nested"),
+			Mode:    0o644,
+			ModTime: time.Unix(1234567890, 0),
+		},
+		"link": &fstest.MapFile{
+			Data:    []byte("dir/file.txt"),
+			Mode:    fs.ModeSymlink | 0o777,
+			ModTime: time.Unix(1234567890, 0),
+		},
+	}
+	// A directory with enough entries to exceed one block, so its dirent
+	// data is split into full blocks plus an inline tail.
+	for i := 0; i < 400; i++ {
+		name := fmt.Sprintf("bigdir/entry-%04d.txt", i)
+		testFS[name] = &fstest.MapFile{
+			Data:    []byte("x"),
+			Mode:    0o644,
+			ModTime: time.Unix(1234567890, 0),
+		}
+	}
+
+	buf := newBytesWriterAt(1024 * 1024)
+	require.NoError(t, Create(buf, testFS, WithAllRoot(true)))
+
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	layoutOf := func(path string) uint16 {
+		t.Helper()
+		info, err := fsys.Lstat(path)
+		require.NoError(t, err)
+		return info.Sys().(*Inode).DataLayout()
+	}
+
+	// Regular files must never carry inline data (DAX).
+	require.Equal(t, uint16(InodeDataLayoutFlatPlain), layoutOf("small.txt"))
+	require.Equal(t, uint16(InodeDataLayoutFlatPlain), layoutOf("tail.bin"))
+
+	// Small directories and symlinks are fully inlined.
+	require.Equal(t, uint16(InodeDataLayoutFlatInline), layoutOf("dir"))
+	require.Equal(t, uint16(InodeDataLayoutFlatInline), layoutOf("link"))
+
+	// Large directories keep full blocks in the data area with an inline
+	// tail (still flat inline layout).
+	bigdirInfo, err := fsys.Stat("bigdir")
+	require.NoError(t, err)
+	bigdirIno := bigdirInfo.Sys().(*Inode)
+	require.Greater(t, bigdirIno.Size(), uint64(BlockSize), "bigdir should span multiple blocks")
+	require.Equal(t, uint16(InodeDataLayoutFlatInline), bigdirIno.DataLayout())
+
+	// Round-trip: every entry of the multi-block directory is listed and
+	// readable, and the symlink resolves.
+	entries, err := fsys.ReadDir("bigdir")
+	require.NoError(t, err)
+	require.Len(t, entries, 400)
+
+	f, err := fsys.Open("bigdir/entry-0399.txt")
+	require.NoError(t, err)
+	content, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.Equal(t, "x", string(content))
+	require.NoError(t, f.Close())
+
+	target, err := fsys.ReadLink("link")
+	require.NoError(t, err)
+	require.Equal(t, "dir/file.txt", target)
 }

@@ -32,14 +32,18 @@ const (
 	BlockSize     = 4096
 	BlockSizeBits = 12
 	InodeSlotSize = 1 << InodeSlotBits
-	// MaxInlineDataSize is the threshold for inlining small files. Files up to
-	// this size are stored inline with the inode metadata. Set to 0 to
-	// represent the flag '-E noinline_data': inline data is incompatible with
-	// DAX, which requires file data to be block-aligned.
+	// MaxInlineDataSize is the threshold for inlining small regular files.
+	// Files up to this size are stored inline with the inode metadata. Set to
+	// 0 to represent the flag '-E noinline_data': inline file data is
+	// incompatible with DAX, which requires file data to be block-aligned.
+	// Directory and symlink data is not affected by this threshold (it is not
+	// mapped through DAX and is always inlined when it fits, matching
+	// mkfs.erofs behavior).
 	MaxInlineDataSize = 0
 	// MaxTailSize is the maximum tail size (size % BlockSize) that is inlined
-	// with the inode for files larger than one block (tail-packing). Set to 0
-	// to disable tail-packing, which is likewise incompatible with DAX.
+	// with the inode for regular files larger than one block (tail-packing).
+	// Set to 0 to disable tail-packing for file data, which is likewise
+	// incompatible with DAX.
 	MaxTailSize = 0
 )
 
@@ -231,19 +235,13 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			fsIno = archivefs.GetIno(info.Sys())
 		}
 
-		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
-		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
-		inlined := size > 0 && size <= MaxInlineDataSize
-
-		// Tail-packing (regular files only): full blocks go to the data area
-		// and the remaining tail is inlined with the inode. Files smaller than
-		// a block (nblocks == 0) use inlining or plain blocks instead.
+		// Decide the data layout: fully inline (all data with the inode),
+		// tail-packed (full blocks in the data area, tail with the inode),
+		// or plain (all data in the data area).
+		inodeSize := int64(binary.Size(ino))
 		nblocks := size / BlockSize
 		tailSize := size % BlockSize
-		useTailPacking := mode&S_IFMT == S_IFREG && !inlined &&
-			nblocks > 0 && tailSize > 0 && tailSize <= MaxTailSize
-
-		inodeSize := int64(binary.Size(ino))
+		inlined, useTailPacking := inlinePolicy(mode, size, inodeSize)
 
 		// Subsequent occurrences of a hard link reuse the first occurrence's
 		// inode: they consume no metadata slot and no data blocks.
@@ -477,16 +475,13 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 
 		var nid uint32
 		var fileSize int64
-		var mode uint16
 		switch ino := ino.(type) {
 		case InodeCompact:
 			nid = ino.Ino
 			fileSize = int64(ino.Size)
-			mode = ino.Mode
 		case InodeExtended:
 			nid = ino.Ino
 			fileSize = int64(ino.Size)
-			mode = ino.Mode
 		default:
 			return fmt.Errorf("unsupported inode type %T", ino)
 		}
@@ -517,12 +512,12 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 				return fmt.Errorf("failed to get data for %q: %w", path, err)
 			}
 
-			isDir := mode&S_IFMT == S_IFDIR
-			inlineSize := fileSize
-			if fileSize > MaxInlineDataSize && !isDir {
-				// Tail-packed: skip the full blocks, keep only the tail.
-				nblocks := fileSize / BlockSize
-				inlineSize = fileSize % BlockSize
+			// Skip the full blocks (they are written to the data area) and
+			// inline only the tail. Fully inlined data has no full blocks,
+			// so everything after this is the whole file.
+			nblocks := fileSize / BlockSize
+			inlineSize := fileSize % BlockSize
+			if nblocks > 0 {
 				if _, err := io.CopyN(io.Discard, data, nblocks*BlockSize); err != nil {
 					_ = data.Close()
 					return fmt.Errorf("failed to skip full blocks for %q: %w", path, err)
@@ -989,10 +984,54 @@ func isInlined(ino any) bool {
 	return bitRange(format, InodeDataLayoutBit, InodeDataLayoutBits) == InodeDataLayoutFlatInline
 }
 
+// inlinePolicy decides how an inode's data is laid out. It returns
+// inlined=true when all the data is stored with the inode metadata (no data
+// blocks), tailPacked=true when the full blocks go to the data area and only
+// the tail (size % BlockSize) is stored with the inode. When both are false
+// the data lives entirely in the data area (flat plain).
+//
+// Regular file data is only inlined within the MaxInlineDataSize /
+// MaxTailSize thresholds (currently 0: inline file data is incompatible with
+// DAX, which requires block-aligned file data). Directory and symlink data is
+// never mapped through DAX and is always inlined when it fits in the inode's
+// block — matching mkfs.erofs, whose '-E noinline_data' option only affects
+// regular files.
+func inlinePolicy(mode uint16, size, inodeSize int64) (inlined, tailPacked bool) {
+	if size == 0 {
+		return false, false
+	}
+
+	nblocks := size / BlockSize
+	tailSize := size % BlockSize
+
+	switch mode & S_IFMT {
+	case S_IFREG:
+		if size <= MaxInlineDataSize {
+			return true, false
+		}
+		if nblocks > 0 && tailSize > 0 && tailSize <= MaxTailSize {
+			return false, true
+		}
+	case S_IFDIR, S_IFLNK:
+		// The inline data shares a block with the inode, so the tail must
+		// leave room for the inode itself; otherwise fall back to plain
+		// blocks.
+		if tailSize == 0 || tailSize > BlockSize-inodeSize {
+			return false, false
+		}
+		if nblocks == 0 {
+			return true, false
+		}
+		return false, true
+	}
+
+	return false, false
+}
+
 // hasDataBlocks reports whether the inode owns blocks in the data area:
 // all flat-plain inodes do, and flat-inline inodes do when they are
-// tail-packed (size larger than the inline threshold), since their full
-// blocks live in the data area and only the tail is inline.
+// tail-packed (at least one full block), since their full blocks live in
+// the data area and only the tail is inline.
 func hasDataBlocks(ino any) bool {
 	switch v := ino.(type) {
 	case InodeCompact:
@@ -1001,7 +1040,7 @@ func hasDataBlocks(ino any) bool {
 			return true
 		}
 		if layout == InodeDataLayoutFlatInline {
-			return int64(v.Size) > MaxInlineDataSize
+			return v.Size >= BlockSize
 		}
 	case InodeExtended:
 		layout := bitRange(v.Format, InodeDataLayoutBit, InodeDataLayoutBits)
@@ -1009,7 +1048,7 @@ func hasDataBlocks(ino any) bool {
 			return true
 		}
 		if layout == InodeDataLayoutFlatInline {
-			return v.Size > uint64(MaxInlineDataSize)
+			return v.Size >= BlockSize
 		}
 	}
 	return false
