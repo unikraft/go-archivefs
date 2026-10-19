@@ -65,6 +65,7 @@ type writer struct {
 
 type inodeCount struct {
 	Count        int
+	Nlink        int // The number of links to this inode in the source tree
 	Inode        uint64
 	RawBlockAddr uint32 // The block address for the first occurrence of this hardlink
 }
@@ -106,15 +107,22 @@ func (w *writer) write() error {
 		return fmt.Errorf("unsupported root inode type %T", rootIno)
 	}
 
-	// Generate a UUID for the filesystem.
-	uuidBytes, err := uuid.New().MarshalBinary()
-	if err != nil {
-		return fmt.Errorf("failed to generate UUID: %w", err)
+	var sbUUID [16]uint8
+	if w.opts.uuid != nil {
+		sbUUID = *w.opts.uuid
+	} else {
+		// Generate a UUID for the filesystem.
+		uuidBytes, err := uuid.New().MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("failed to generate UUID: %w", err)
+		}
+		copy(sbUUID[:], uuidBytes)
 	}
-	var uuid [16]uint8
-	copy(uuid[:], uuidBytes)
 
-	timeNow := time.Now()
+	buildTime := time.Now()
+	if w.opts.buildTime != nil {
+		buildTime = *w.opts.buildTime
+	}
 
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
@@ -123,9 +131,9 @@ func (w *writer) write() error {
 		Inodes:        uint64(len(w.inodes)),
 		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
-		UUID:          uuid,
-		BuildTime:     uint64(timeNow.Unix()),
-		BuildTimeNsec: uint32(timeNow.Nanosecond()),
+		UUID:          sbUUID,
+		BuildTime:     uint64(buildTime.Unix()),
+		BuildTimeNsec: uint32(buildTime.Nanosecond()),
 		FeatureCompat: EROFS_FEATURE_COMPAT_SB_CHKSUM | EROFS_FEATURE_COMPAT_MTIME,
 		// TODO: other fields (volume name, etc.)
 	}
@@ -245,6 +253,8 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 						entry.Count += 1
 					}
 					ino.Size = uint32(size)
+					// Count only the links that are in the source tree.
+					ino.Nlink = uint16(entry.Nlink)
 					ino.RawBlockAddr = entry.RawBlockAddr
 					rawBlockAssigned = true
 
@@ -308,6 +318,8 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 						entry.Count += 1
 					}
 					ino.Size = uint64(size)
+					// Count only the links that are in the source tree.
+					ino.Nlink = uint32(entry.Nlink)
 					ino.RawBlockAddr = entry.RawBlockAddr
 					rawBlockAssigned = true
 
@@ -504,11 +516,9 @@ func (w *writer) populateInodes() error {
 			nlink = int(archivefs.GetNlink(fi.Sys()))
 			ino := archivefs.GetIno(fi.Sys())
 			if ino != 0 {
-				if _, ok := w.linkMap[ino]; !ok {
-					w.linkMap[ino] = inodeCount{
-						Count: 0,
-					}
-				}
+				entry := w.linkMap[ino]
+				entry.Nlink++
+				w.linkMap[ino] = entry
 			}
 		}
 

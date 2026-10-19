@@ -1138,6 +1138,52 @@ func TestEROFSHardlinkDeduplication(t *testing.T) {
 	}
 }
 
+// TestEROFSReproducible verifies that two identical source trees give the
+// same image bytes when the UUID and the build time are set.
+func TestEROFSReproducible(t *testing.T) {
+	id := [16]byte{0xde, 0xad, 0xbe, 0xef}
+	buildTime := time.Unix(1700000000, 0)
+	modTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	outside := t.TempDir()
+
+	// pack makes a new tree and returns its image. A hardlink outside the
+	// tree must not change the image.
+	pack := func(linkOutside bool) []byte {
+		srcDir := t.TempDir()
+		etcDir := filepath.Join(srcDir, "etc")
+		hosts := filepath.Join(etcDir, "hosts")
+		require.NoError(t, os.Mkdir(etcDir, 0o755))
+		require.NoError(t, os.WriteFile(hosts, []byte("127.0.0.1 localhost\n"), 0o644))
+		require.NoError(t, os.Link(hosts, filepath.Join(srcDir, "hosts")))
+		if linkOutside {
+			require.NoError(t, os.Link(hosts, filepath.Join(outside, "hosts")))
+		}
+		for _, p := range []string{hosts, etcDir, srcDir} {
+			require.NoError(t, os.Chtimes(p, modTime, modTime))
+		}
+
+		imgPath := filepath.Join(t.TempDir(), "image.erofs")
+		dstFile, err := os.Create(imgPath)
+		require.NoError(t, err)
+		require.NoError(t, erofs.Create(dstFile, os.DirFS(srcDir), erofs.WithUUID(id), erofs.WithBuildTime(buildTime)))
+		require.NoError(t, dstFile.Close())
+
+		data, err := os.ReadFile(imgPath)
+		require.NoError(t, err)
+		return data
+	}
+
+	first := pack(true)
+	second := pack(false)
+	require.True(t, bytes.Equal(first, second), "images of identical trees should be identical")
+
+	img, err := erofs.OpenImage(bytes.NewReader(first))
+	require.NoError(t, err)
+	sb := img.SuperBlock()
+	require.Equal(t, id, sb.UUID)
+	require.Equal(t, uint64(buildTime.Unix()), sb.BuildTime)
+}
+
 // TestEROFSZeroInodeNoDedupe verifies that when the source filesystem returns
 // inode 0 for all files (i.e. no inode info available), the erofs writer does
 // not falsely deduplicate file data. Each file should have its own content.
