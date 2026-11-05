@@ -14,6 +14,8 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+
+	"github.com/unikraft/go-archivefs"
 )
 
 // Create creates a tar archive from the given filesystem.
@@ -55,6 +57,11 @@ func Create(dst io.Writer, src fs.FS) error {
 			return err
 		}
 		hdr.Name = path
+		xattrs, err := archivefs.GetXattrs(fi.Sys())
+		if err != nil {
+			return err
+		}
+		archivefs.SetTarXattrs(hdr, xattrs)
 
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
