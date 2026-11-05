@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -645,7 +646,7 @@ func TestWriterOffsetAlignment(t *testing.T) {
 			content[j] = byte(j % 256)
 		}
 
-		testFS[filepath.Join("file", "test", string(rune('a'+i%26)), string(rune('0'+i%10))+".dat")] = &fstest.MapFile{
+		testFS[path.Join("file", "test", string(rune('a'+i%26)), string(rune('0'+i%10))+".dat")] = &fstest.MapFile{
 			Data:    content,
 			Mode:    0o644,
 			ModTime: time.Unix(1234567890, 0),
