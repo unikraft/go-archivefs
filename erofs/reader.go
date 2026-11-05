@@ -72,9 +72,7 @@ const (
 const (
 	InodeDataLayoutFlatPlain = iota
 	InodeDataLayoutFlatCompressionLegacy
-	// FlatInline is used for:
-	// 1. Fully inline files (size <= MaxInlineDataSize): all data inline, including empty files
-	// 2. Tail-packed files (size > MaxInlineDataSize): full blocks in data area + tail inline
+	// FlatInline keeps all the data, or the tail after the full blocks, right after the inode.
 	InodeDataLayoutFlatInline
 	InodeDataLayoutFlatCompression
 	InodeDataLayoutChunkBased

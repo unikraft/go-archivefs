@@ -33,18 +33,9 @@ const (
 	BlockSize     = 4096
 	BlockSizeBits = 12
 	InodeSlotSize = 1 << InodeSlotBits
-	// MaxInlineDataSize is the threshold for inlining small regular files.
-	// Files up to this size are stored inline with the inode metadata. Set to
-	// 0 to represent the flag '-E noinline_data': inline file data is
-	// incompatible with DAX, which requires file data to be block-aligned.
-	// Directory and symlink data is not affected by this threshold (it is not
-	// mapped through DAX and is always inlined when it fits, matching
-	// mkfs.erofs behavior).
+	// MaxInlineDataSize is the largest regular file stored inline; 0 keeps file data aligned for DAX.
 	MaxInlineDataSize = 0
-	// MaxTailSize is the maximum tail size (size % BlockSize) that is inlined
-	// with the inode for regular files larger than one block (tail-packing).
-	// Set to 0 to disable tail-packing for file data, which is likewise
-	// incompatible with DAX.
+	// MaxTailSize is the largest regular file tail stored inline; 0 keeps file data aligned for DAX.
 	MaxTailSize = 0
 )
 
@@ -99,9 +90,7 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to calculate metadata and data size: %w", err)
 	}
 
-	// Metadata starts at block 0. The superblock lives at offset 1024 within
-	// block 0 and firstPass reserved space for it, so inodes can share the
-	// first block with the superblock. This matches the mkfs.erofs behavior.
+	// Metadata starts at block 0 and shares it with the superblock, like mkfs.erofs.
 	metaBlockAddr := int64(0)
 
 	if err := w.writeMetadata(metaBlockAddr); err != nil {
@@ -283,9 +272,7 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			size = 0
 		}
 
-		// Decide the data layout: fully inline (all data with the inode),
-		// tail-packed (full blocks in the data area, tail with the inode),
-		// or plain (all data in the data area).
+		// Decide the data layout: fully inline, tail-packed (only the tail inline) or plain.
 		inodeSize := int64(binary.Size(ino)) + int64(len(w.xattrs[path]))
 		nblocks := size / BlockSize
 		tailSize := size % BlockSize
