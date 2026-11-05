@@ -1036,3 +1036,44 @@ func TestWriterDevice(t *testing.T) {
 	testFS := fstest.MapFS{"f": &fstest.MapFile{Data: []byte("f"), Mode: 0o644}}
 	require.NoError(t, Create(dev, testFS))
 }
+
+// changedFS is a file system in which "f" has other data when it is opened than when it is walked.
+type changedFS struct {
+	fstest.MapFS
+	changed fstest.MapFS
+}
+
+func (c changedFS) Open(name string) (fs.File, error) {
+	if name == "f" {
+		return c.changed.Open(name)
+	}
+	return c.MapFS.Open(name)
+}
+
+func TestWriterFileGrows(t *testing.T) {
+	src := changedFS{
+		MapFS:   fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("g"), BlockSize), Mode: 0o644}},
+		changed: fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("G"), 3*BlockSize), Mode: 0o644}},
+	}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, src))
+	var sb SuperBlock
+	require.NoError(t, binary.Read(bytes.NewReader(buf.Bytes()[SuperBlockOffset:]), binary.LittleEndian, &sb))
+	require.Equal(t, int64(sb.Blocks)*BlockSize, int64(len(buf.Bytes())))
+
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	got, err := fs.ReadFile(fsys, "f")
+	require.NoError(t, err)
+	require.Equal(t, bytes.Repeat([]byte("G"), BlockSize), got)
+}
+
+func TestWriterFileShrinks(t *testing.T) {
+	src := changedFS{
+		MapFS:   fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("g"), 3*BlockSize), Mode: 0o644}},
+		changed: fstest.MapFS{"f": &fstest.MapFile{Data: []byte("short"), Mode: 0o644}},
+	}
+
+	require.ErrorContains(t, Create(newBytesWriterAt(0), src), "became shorter")
+}

@@ -584,13 +584,16 @@ func (w *writer) writeData() error {
 
 		var rawBlockAddr uint32
 		var nid uint32
+		var size int64
 		switch ino := ino.(type) {
 		case InodeCompact:
 			rawBlockAddr = ino.RawBlockAddr
 			nid = ino.Ino
+			size = int64(ino.Size)
 		case InodeExtended:
 			rawBlockAddr = ino.RawBlockAddr
 			nid = ino.Ino
+			size = int64(ino.Size)
 		default:
 			return fmt.Errorf("unsupported inode type %T", ino)
 		}
@@ -600,7 +603,8 @@ func (w *writer) writeData() error {
 		}
 		writtenInodes[nid] = true
 
-		data, size, err := w.dataForInode(path, ino)
+		// The file can change after the first pass, so copy only the size in the inode.
+		data, _, err := w.dataForInode(path, ino)
 		if err != nil {
 			return fmt.Errorf("failed to get data for %q: %w", path, err)
 		}
@@ -616,9 +620,12 @@ func (w *writer) writeData() error {
 				_, err = io.CopyN(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data, nblocks*BlockSize)
 			}
 		} else {
-			_, err = io.Copy(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data)
+			_, err = io.CopyN(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data, size)
 		}
 		_ = data.Close()
+		if errors.Is(err, io.EOF) {
+			err = fmt.Errorf("the file became shorter after the first pass: %w", err)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to write data for %q: %w", path, err)
 		}
