@@ -63,12 +63,13 @@ type writer struct {
 	inodeOrder []string
 	fileSizes  map[string]int64
 	linkMap    map[linkKey]inodeCount
-	linkKeys   map[string]linkKey // hard link group of each path whose source has an inode number
+	linkKeys   map[string]linkKey // hard link group of each path with more than one link
 	opts       ErofsCreateOptions
 }
 
-// linkKey identifies a hard link group. Like in the Linux initramfs unpacker, all links have one type.
+// linkKey identifies a hard link group by device, inode number and type, like the Linux initramfs unpacker.
 type linkKey struct {
+	dev uint64
 	ino uint64
 	typ uint16
 }
@@ -650,9 +651,10 @@ func (w *writer) populateInodes() error {
 				}
 			}
 		} else {
-			nlink = int(archivefs.GetNlink(fi.Sys()))
-			if ino := archivefs.GetIno(fi.Sys()); ino != 0 {
-				key := linkKey{ino, statModeFromFileMode(fi.Mode()) & S_IFMT}
+			// Like in the Linux initramfs unpacker, only files with more than one link are in a group.
+			if n, ino := archivefs.GetNlink(fi.Sys()), archivefs.GetIno(fi.Sys()); n > 1 && ino != 0 {
+				nlink = int(n)
+				key := linkKey{archivefs.GetDev(fi.Sys()), ino, statModeFromFileMode(fi.Mode()) & S_IFMT}
 				w.linkKeys[path] = key
 				entry := w.linkMap[key]
 				entry.Nlink++
