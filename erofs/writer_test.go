@@ -1025,3 +1025,14 @@ func TestWriterLongSymlink(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, target[:BlockSize-1], got)
 }
+
+func TestWriterDevice(t *testing.T) {
+	dev, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/null")
+	}
+	defer dev.Close()
+
+	testFS := fstest.MapFS{"f": &fstest.MapFile{Data: []byte("f"), Mode: 0o644}}
+	require.NoError(t, Create(dev, testFS))
+}
