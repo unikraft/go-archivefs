@@ -874,3 +874,37 @@ func TestWriterDaxSafeInlining(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "dir/file.txt", target)
 }
+
+func TestWriterImageSize(t *testing.T) {
+	testFS := fstest.MapFS{
+		"a.txt": &fstest.MapFile{Data: []byte("a"), Mode: 0o644},
+		"b.bin": &fstest.MapFile{Data: bytes.Repeat([]byte("b"), BlockSize+1), Mode: 0o644},
+	}
+
+	blocks := func(img []byte) int64 {
+		var sb SuperBlock
+		err := binary.Read(bytes.NewReader(img[SuperBlockOffset:]), binary.LittleEndian, &sb)
+		require.NoError(t, err)
+		return int64(sb.Blocks)
+	}
+
+	t.Run("writer at", func(t *testing.T) {
+		buf := newBytesWriterAt(0)
+		require.NoError(t, Create(buf, testFS, WithAllRoot(true)))
+		require.Equal(t, blocks(buf.Bytes())*BlockSize, int64(len(buf.Bytes())))
+	})
+
+	t.Run("file", func(t *testing.T) {
+		f, err := os.Create(filepath.Join(t.TempDir(), "img"))
+		require.NoError(t, err)
+		defer f.Close()
+
+		_, err = f.WriteAt(make([]byte, 1<<20), 0)
+		require.NoError(t, err)
+		require.NoError(t, Create(f, testFS, WithAllRoot(true)))
+
+		img, err := os.ReadFile(f.Name())
+		require.NoError(t, err)
+		require.Equal(t, blocks(img)*BlockSize, int64(len(img)))
+	})
+}

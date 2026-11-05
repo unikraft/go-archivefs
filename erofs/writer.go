@@ -17,7 +17,6 @@ import (
 	"io"
 	"io/fs"
 	"math"
-	"os"
 	stdpath "path"
 	"path/filepath"
 	"slices"
@@ -52,7 +51,7 @@ const (
 func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 	w := &writer{
 		src: src,
-		dst: dst,
+		dst: &endWriterAt{WriterAt: dst},
 	}
 
 	for _, opt := range opts {
@@ -66,7 +65,7 @@ func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 
 type writer struct {
 	src        fs.FS
-	dst        io.WriterAt
+	dst        *endWriterAt
 	inodes     map[string]any
 	inodeOrder []string
 	fileSizes  map[string]int64
@@ -182,9 +181,35 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write superblock: %w", err)
 	}
 
-	if f, ok := w.dst.(*os.File); ok {
-		if err := f.Truncate(int64(sb.Blocks) * BlockSize); err != nil {
-			return fmt.Errorf("failed to truncate destination file: %w", err)
+	if err := w.dst.setSize(int64(sb.Blocks) * BlockSize); err != nil {
+		return fmt.Errorf("failed to set the image size: %w", err)
+	}
+
+	return nil
+}
+
+// endWriterAt is an io.WriterAt that records the end of the furthest write.
+type endWriterAt struct {
+	io.WriterAt
+	end int64
+}
+
+func (w *endWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := w.WriterAt.WriteAt(p, off)
+	w.end = max(w.end, off+int64(n))
+	return n, err
+}
+
+// setSize truncates the destination to size, or else writes zeros up to size.
+func (w *endWriterAt) setSize(size int64) error {
+	if t, ok := w.WriterAt.(interface{ Truncate(int64) error }); ok {
+		return t.Truncate(size)
+	}
+
+	zero := make([]byte, BlockSize)
+	for off := w.end; off < size; off += BlockSize {
+		if _, err := w.WriteAt(zero[:min(BlockSize, size-off)], off); err != nil {
+			return err
 		}
 	}
 
