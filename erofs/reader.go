@@ -354,6 +354,7 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 	var (
 		rawBlockAddr uint32
 		inodeSize    int64
+		icount       uint16
 	)
 
 	switch layout := inode.Layout(); layout {
@@ -363,11 +364,8 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 			return Inode{}, err
 		}
 
-		if ino.XattrCount != 0 {
-			return Inode{}, fmt.Errorf("unsupported xattr at inode %d", nid)
-		}
-
 		rawBlockAddr = ino.RawBlockAddr
+		icount = ino.XattrCount
 		inodeSize = int64(binary.Size(*ino))
 
 		inode.size = uint64(ino.Size)
@@ -384,11 +382,8 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 			return Inode{}, err
 		}
 
-		if ino.XattrCount != 0 {
-			return Inode{}, fmt.Errorf("unsupported xattr at inode %d", nid)
-		}
-
 		rawBlockAddr = ino.RawBlockAddr
+		icount = ino.XattrCount
 		inodeSize = int64(binary.Size(*ino))
 
 		inode.size = ino.Size
@@ -403,6 +398,9 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 		return Inode{}, fmt.Errorf("unsupported layout at inode %d", nid)
 	}
 
+	xattrSize := xattrIbodySize(icount)
+	inode.xattrOff, inode.xattrSize = off+inodeSize, xattrSize
+
 	blockSize := int64(i.BlockSize())
 	inode.blocks = (int64(inode.size) + (blockSize - 1)) / blockSize
 
@@ -416,14 +414,15 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 				nid, inode.size)
 		}
 
-		// For tail-packing, we need a non-zero tail that fits in the metadata block
-		if tailSize > blockSize-inodeSize {
+		// The inline data follows the inode and its xattrs, in the same block.
+		idataOff := off + inodeSize + xattrSize
+		if idataOff%blockSize+tailSize > blockSize {
 			return Inode{}, fmt.Errorf("inline data would cross block boundary at inode %d, tail size: %d",
 				nid, tailSize)
 		}
 
 		if inode.size > 0 {
-			inode.idataOff = off + inodeSize
+			inode.idataOff = idataOff
 		}
 		fallthrough
 
@@ -502,6 +501,9 @@ type Inode struct {
 	// rdev holds the EROFS-encoded device number (new_encode_dev) for block
 	// and character device inodes. Zero for all other file types.
 	rdev uint32
+
+	// xattrOff and xattrSize locate the inline xattr area of this inode.
+	xattrOff, xattrSize int64
 }
 
 // bitRange returns the bits within the range [bit, bit+bits) in value.
@@ -629,6 +631,14 @@ func (ino *Inode) GetIno() uint64 { return ino.Nid() }
 
 // GetNlink implements [archivefs.InodeInfo].
 func (ino *Inode) GetNlink() uint64 { return uint64(ino.Nlink()) }
+
+// GetXattrs implements [archivefs.XattrInfo].
+func (ino *Inode) GetXattrs() (map[string]string, error) {
+	if ino.xattrSize == 0 {
+		return nil, nil
+	}
+	return ino.image.readXattrs(ino.xattrOff, ino.xattrSize)
+}
 
 // GetUID implements [archivefs.OwnerInfo].
 func (ino *Inode) GetUID() int { return int(ino.UID()) }
