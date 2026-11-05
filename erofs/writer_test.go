@@ -1010,3 +1010,18 @@ func TestWriterInodeNumberCollision(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, fs.ModeNamedPipe, fi.Mode().Type())
 }
+
+func TestWriterLongSymlink(t *testing.T) {
+	target := strings.Repeat("t", BlockSize+100)
+	testFS := fstest.MapFS{"link": &fstest.MapFile{Data: []byte(target), Mode: fs.ModeSymlink | 0o777}}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, testFS))
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	// Like Linux, the reader returns at most one block minus the terminating NUL.
+	got, err := fsys.ReadLink("link")
+	require.NoError(t, err)
+	require.Equal(t, target[:BlockSize-1], got)
+}

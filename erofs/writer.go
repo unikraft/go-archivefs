@@ -1022,10 +1022,11 @@ func inlinePolicy(mode uint16, size, inodeSize int64) (inlined, tailPacked bool)
 		if nblocks > 0 && tailSize > 0 && tailSize <= MaxTailSize {
 			return false, true
 		}
-	case S_IFDIR, S_IFLNK:
-		// The inline data shares a block with the inode, so the tail must
-		// leave room for the inode itself; otherwise fall back to plain
-		// blocks.
+	case S_IFLNK:
+		// The reader reads a symlink target in one piece, so it is never tail-packed.
+		return nblocks == 0 && tailSize <= BlockSize-inodeSize, false
+	case S_IFDIR:
+		// The tail shares a block with the inode, so it must leave room for the inode.
 		if tailSize == 0 || tailSize > BlockSize-inodeSize {
 			return false, false
 		}
