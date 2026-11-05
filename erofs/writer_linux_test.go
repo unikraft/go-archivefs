@@ -10,7 +10,6 @@
 package erofs
 
 import (
-	"bytes"
 	"io/fs"
 	"syscall"
 	"testing"
@@ -33,10 +32,7 @@ func TestWriterInodeNumberOnOtherDevice(t *testing.T) {
 		"zero": &fstest.MapFile{Mode: chr, Sys: &syscall.Stat_t{Dev: 2, Ino: 9, Nlink: 2, Rdev: 1<<8 | 5}},
 	}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, testFS))
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS)
 
 	inode := func(name string) *Inode {
 		fi, err := fsys.Stat(name)

@@ -11,7 +11,6 @@ package erofs
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"io/fs"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/unikraft/go-archivefs/internal/testutil"
 )
 
 // bytesWriterAt implements io.WriterAt for a byte slice
@@ -52,6 +52,19 @@ func (w *bytesWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
 
 func (w *bytesWriterAt) Bytes() []byte {
 	return w.buf
+}
+
+// newImage writes an image of fsys, checks it with fsck.erofs, and opens it.
+func newImage(t *testing.T, fsys fs.FS, opts ...ErofsCreateOption) ([]byte, *Filesystem) {
+	t.Helper()
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, fsys, opts...))
+	path := filepath.Join(t.TempDir(), "img.erofs")
+	require.NoError(t, os.WriteFile(path, buf.Bytes(), 0o644))
+	testutil.CheckEROFS(t, path)
+	img, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	return buf.Bytes(), img
 }
 
 // TestWriterDaxSafeInlining checks that, like mkfs.erofs -E noinline_data, only directories and symlinks have inline data.
@@ -88,11 +101,7 @@ func TestWriterDaxSafeInlining(t *testing.T) {
 		}
 	}
 
-	buf := newBytesWriterAt(1024 * 1024)
-	require.NoError(t, Create(buf, testFS, WithAllRoot(true)))
-
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS, WithAllRoot(true))
 
 	layoutOf := func(path string) uint16 {
 		t.Helper()
@@ -141,10 +150,7 @@ func TestWriterDirectoryNlink(t *testing.T) {
 		"a/link": &fstest.MapFile{Data: []byte("b"), Mode: fs.ModeSymlink | 0o777},
 	}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, testFS, WithAllRoot(true)))
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS, WithAllRoot(true))
 
 	for name, want := range map[string]uint32{".": 3, "a": 4, "a/b": 2, "a/c": 2} {
 		fi, err := fsys.Stat(name)
@@ -159,6 +165,18 @@ type inodeSys struct{ ino, nlink uint64 }
 func (s inodeSys) GetIno() uint64   { return s.ino }
 func (s inodeSys) GetNlink() uint64 { return s.nlink }
 
+func TestWriterSmallImage(t *testing.T) {
+	// The inodes and the root directory share block 0 with the superblock, and hard links are one inode.
+	testFS := fstest.MapFS{
+		"a": &fstest.MapFile{Data: []byte("a"), Mode: 0o644, Sys: inodeSys{7, 2}},
+		"b": &fstest.MapFile{Data: []byte("a"), Mode: 0o644, Sys: inodeSys{7, 2}},
+	}
+	img, fsys := newImage(t, testFS)
+	require.Equal(t, uint64(2), fsys.image.sb.Inodes)
+	require.Equal(t, uint32(0), fsys.image.sb.MetaBlockAddr)
+	require.Len(t, img, 2*BlockSize)
+}
+
 func TestWriterHardLinkLayout(t *testing.T) {
 	// The links get inodes of different sizes, and "aa" is written between them.
 	target := strings.Repeat("t", 4040)
@@ -169,10 +187,7 @@ func TestWriterHardLinkLayout(t *testing.T) {
 		"b":  &fstest.MapFile{Data: []byte(target), Mode: fs.ModeSymlink | 0o777, Sys: inodeSys{7, 2}, ModTime: time.Unix(1, 0)},
 	}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, testFS))
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS)
 
 	for _, name := range []string{"a", "b"} {
 		got, err := fsys.ReadLink(name)
@@ -190,10 +205,7 @@ func TestWriterSpecialFileHardLinks(t *testing.T) {
 		"fifo2": &fstest.MapFile{Mode: fs.ModeNamedPipe | 0o644, Sys: inodeSys{9, 2}},
 	}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, testFS))
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS)
 
 	var nids []uint64
 	for _, name := range []string{"fifo1", "fifo2"} {
@@ -217,10 +229,7 @@ func TestWriterInodeNumberCollision(t *testing.T) {
 		"z":    &fstest.MapFile{Data: zdata, Mode: 0o644, Sys: inodeSys{7, 2}},
 	}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, testFS))
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS)
 
 	for name, want := range map[string][]byte{"c": data, "r": []byte("r"), "z": zdata} {
 		got, err := fs.ReadFile(fsys, name)
@@ -239,10 +248,7 @@ func TestWriterLongSymlink(t *testing.T) {
 	target := strings.Repeat("t", BlockSize+100)
 	testFS := fstest.MapFS{"link": &fstest.MapFile{Data: []byte(target), Mode: fs.ModeSymlink | 0o777}}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, testFS))
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
+	_, fsys := newImage(t, testFS)
 
 	fi, err := fsys.Lstat("link")
 	require.NoError(t, err)
@@ -282,14 +288,9 @@ func TestWriterFileGrows(t *testing.T) {
 		changed: fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("G"), 3*BlockSize), Mode: 0o644}},
 	}
 
-	buf := newBytesWriterAt(0)
-	require.NoError(t, Create(buf, src))
-	var sb SuperBlock
-	require.NoError(t, binary.Read(bytes.NewReader(buf.Bytes()[SuperBlockOffset:]), binary.LittleEndian, &sb))
-	require.Equal(t, int64(sb.Blocks)*BlockSize, int64(len(buf.Bytes())))
+	img, fsys := newImage(t, src)
+	require.Equal(t, int64(fsys.image.Blocks())*BlockSize, int64(len(img)))
 
-	fsys, err := Open(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
 	got, err := fs.ReadFile(fsys, "f")
 	require.NoError(t, err)
 	require.Equal(t, bytes.Repeat([]byte("G"), BlockSize), got)
@@ -321,6 +322,7 @@ func TestWriterReusedDestination(t *testing.T) {
 	_, err = f.Write(bytes.Repeat([]byte{0xaa}, 1<<20))
 	require.NoError(t, err)
 	require.NoError(t, Create(f, testFS, opts...))
+	testutil.CheckEROFS(t, f.Name())
 	got, err := os.ReadFile(f.Name())
 	require.NoError(t, err)
 

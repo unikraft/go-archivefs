@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -276,7 +277,7 @@ func TestEROFSFilenamesSortingBeforeDot(t *testing.T) {
 		require.NoError(t, imgFile.Close())
 	})
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -333,7 +334,7 @@ func TestEROFSFilenamesSortingBeforeDotRoot(t *testing.T) {
 		require.NoError(t, imgFile.Close())
 	})
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -390,7 +391,7 @@ func TestEROFSHiddenFilenames(t *testing.T) {
 		require.NoError(t, imgFile.Close())
 	})
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -479,7 +480,7 @@ func TestEROFSSymlinkCycleDetection(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -521,7 +522,7 @@ func TestEROFSStatLink(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { imgFile.Close() })
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -563,7 +564,7 @@ func TestEROFSSuperBlockChecksum(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	// Valid image should open without error.
 	_, err = erofs.Open(imgFile)
@@ -601,7 +602,7 @@ func TestEROFSRootNidSet(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	img, err := erofs.OpenImage(imgFile)
 	require.NoError(t, err)
@@ -613,13 +614,18 @@ func TestEROFSRootNidSet(t *testing.T) {
 }
 
 func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
-	// Create a valid image with a file.
+	// Make enough files that most inodes are after block 0, where the test cuts the image.
 	var tarBuf bytes.Buffer
 	tw := tar.NewWriter(&tarBuf)
 	fileData := []byte("data")
-	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "file.txt", Size: int64(len(fileData)), Mode: 0o644}))
-	_, err := tw.Write(fileData)
-	require.NoError(t, err)
+	for d := range 20 {
+		for f := range 10 {
+			name := fmt.Sprintf("d%02d/f%d", d, f)
+			require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Size: int64(len(fileData)), Mode: 0o644}))
+			_, err := tw.Write(fileData)
+			require.NoError(t, err)
+		}
+	}
 	require.NoError(t, tw.Close())
 	srcFS, err := tarfs.Open(bytes.NewReader(tarBuf.Bytes()))
 	require.NoError(t, err)
@@ -628,19 +634,22 @@ func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
-	// Read the full image into memory.
 	stat, err := imgFile.Stat()
 	require.NoError(t, err)
 	data := make([]byte, stat.Size())
 	_, err = imgFile.ReadAt(data, 0)
 	require.NoError(t, err)
 
-	// Truncate the image so that the superblock and root inode are intact
-	// but child inodes are cut off. Metadata starts at block 1 (offset 4096).
-	// Keep 96 bytes of metadata: root inode (32 bytes) + inline dir data.
-	truncated := data[:4096+96]
+	fsys, err := erofs.Open(bytes.NewReader(data))
+	require.NoError(t, err)
+	fi, err := fsys.Stat("d19")
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, fi.Sys().(*erofs.Inode).Nid()*32, uint64(4096), "the inode of d19 must be after block 0")
+
+	// The cut after block 0 keeps the superblock and the root directory, but not the later inodes.
+	truncated := data[:4096]
 
 	// Previously getInode would panic on error. Verify that operations on a
 	// corrupted image return errors gracefully.
@@ -650,16 +659,18 @@ func TestEROFSCorruptedInodeNoPanic(t *testing.T) {
 		}
 	}()
 
-	fsys, err := erofs.Open(bytes.NewReader(truncated))
-	if err != nil {
-		return // Open failing is acceptable
-	}
+	fsys, err = erofs.Open(bytes.NewReader(truncated))
+	require.NoError(t, err)
+	entries, err := fsys.ReadDir(".")
+	require.NoError(t, err)
+	require.Len(t, entries, 20)
 
-	// Stat on the file should hit the corrupted/missing inode and return
-	// an error rather than panicking.
-	_, _ = fsys.Stat("file.txt")
-	_, _ = fsys.Open("file.txt")
-	_, _ = fsys.ReadDir(".")
+	_, err = fsys.Stat("d19/f9")
+	require.Error(t, err)
+	_, err = fsys.Open("d19/f9")
+	require.Error(t, err)
+	_, err = fsys.ReadDir("d19")
+	require.Error(t, err)
 }
 
 func TestEROFSModTimeNanoseconds(t *testing.T) {
@@ -690,7 +701,7 @@ func TestEROFSModTimeNanoseconds(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, srcFS))
+	writeImage(t, imgFile, srcFS)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -727,7 +738,7 @@ func TestEROFSZeroModTimeCompactInode(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, wrapped))
+	writeImage(t, imgFile, wrapped)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -865,7 +876,7 @@ func TestEROFSFileOpenedOnce(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, imgFile.Close()) })
 
-	require.NoError(t, erofs.Create(imgFile, cfs))
+	writeImage(t, imgFile, cfs)
 
 	// Each regular file should be opened exactly once (in the write phase).
 	// Before the fix, firstPass would also open each file to get its size.
@@ -918,7 +929,7 @@ func TestEROFSDirEntryTypeReturnsBits(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { imgFile.Close() })
 
-	require.NoError(t, erofs.Create(imgFile, tfs))
+	writeImage(t, imgFile, tfs)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
@@ -966,7 +977,7 @@ func TestEROFSRoundTripPreservesOwnership(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { img1.Close() })
 
-	require.NoError(t, erofs.Create(img1, srcFS))
+	writeImage(t, img1, srcFS)
 
 	fsys1, err := erofs.Open(img1)
 	require.NoError(t, err)
@@ -982,7 +993,7 @@ func TestEROFSRoundTripPreservesOwnership(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { img2.Close() })
 
-	require.NoError(t, erofs.Create(img2, fsys1))
+	writeImage(t, img2, fsys1)
 
 	fsys2, err := erofs.Open(img2)
 	require.NoError(t, err)
@@ -1010,7 +1021,7 @@ func TestEROFSCreate(t *testing.T) {
 		require.NoError(t, dstFile.Close())
 	})
 
-	require.NoError(t, erofs.Create(dstFile, srcFS))
+	writeImage(t, dstFile, srcFS)
 
 	dstFS, err := erofs.Open(dstFile)
 	require.NoError(t, err)
@@ -1083,7 +1094,7 @@ func TestEROFSHardlinkDeduplication(t *testing.T) {
 		require.NoError(t, dstFile.Close())
 	})
 
-	require.NoError(t, erofs.Create(dstFile, os.DirFS(srcDir), erofs.WithAllRoot(true)))
+	writeImage(t, dstFile, os.DirFS(srcDir), erofs.WithAllRoot(true))
 
 	// Get the size of the EROFS filesystem
 	stat, err := dstFile.Stat()
@@ -1165,7 +1176,7 @@ func TestEROFSReproducible(t *testing.T) {
 		imgPath := filepath.Join(t.TempDir(), "image.erofs")
 		dstFile, err := os.Create(imgPath)
 		require.NoError(t, err)
-		require.NoError(t, erofs.Create(dstFile, os.DirFS(srcDir), erofs.WithUUID(id), erofs.WithBuildTime(buildTime)))
+		writeImage(t, dstFile, os.DirFS(srcDir), erofs.WithUUID(id), erofs.WithBuildTime(buildTime))
 		require.NoError(t, dstFile.Close())
 
 		data, err := os.ReadFile(imgPath)
@@ -1206,7 +1217,7 @@ func TestEROFSZeroInodeNoDedupe(t *testing.T) {
 		require.NoError(t, dstFile.Close())
 	})
 
-	require.NoError(t, erofs.Create(dstFile, src, erofs.WithAllRoot(true)))
+	writeImage(t, dstFile, src, erofs.WithAllRoot(true))
 
 	fsys, err := erofs.Open(dstFile)
 	require.NoError(t, err)
