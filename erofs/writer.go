@@ -12,16 +12,17 @@ package erofs
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"io/fs"
 	"math"
-	"os"
 	stdpath "path"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,7 +53,7 @@ const (
 func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 	w := &writer{
 		src: src,
-		dst: dst,
+		dst: &imageWriter{WriterAt: dst},
 	}
 
 	for _, opt := range opts {
@@ -66,17 +67,13 @@ func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 
 type writer struct {
 	src        fs.FS
-	dst        io.WriterAt
+	dst        *imageWriter
 	inodes     map[string]any
 	inodeOrder []string
 	fileSizes  map[string]int64
 	xattrs     map[string][]byte // inline xattr area by path
 	linkMap    map[uint64]inodeCount
 	opts       ErofsCreateOptions
-	// block0 mirrors the first block of the image. Metadata shares block 0
-	// with the superblock, and the superblock checksum covers the whole
-	// block, so we need a copy of what was written there.
-	block0 []byte
 }
 
 type inodeCount struct {
@@ -102,13 +99,6 @@ func (w *writer) write() error {
 	// block 0 and firstPass reserved space for it, so inodes can share the
 	// first block with the superblock. This matches the mkfs.erofs behavior.
 	metaBlockAddr := int64(0)
-
-	// Zero out block 0 before writing metadata, since the superblock checksum
-	// covers the whole block and the destination may contain stale data.
-	if _, err := w.dst.WriteAt(make([]byte, BlockSize), 0); err != nil {
-		return fmt.Errorf("failed to zero block 0: %w", err)
-	}
-	w.block0 = make([]byte, BlockSize)
 
 	if err := w.writeMetadata(metaBlockAddr); err != nil {
 		return fmt.Errorf("failed to write metadata blocks: %w", err)
@@ -182,9 +172,59 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write superblock: %w", err)
 	}
 
-	if f, ok := w.dst.(*os.File); ok {
-		if err := f.Truncate(int64(sb.Blocks) * BlockSize); err != nil {
-			return fmt.Errorf("failed to truncate destination file: %w", err)
+	if err := w.dst.setSize(int64(sb.Blocks) * BlockSize); err != nil {
+		return fmt.Errorf("failed to set the image size: %w", err)
+	}
+
+	return nil
+}
+
+// imageWriter writes the image, writes zeros in the gaps between writes, and keeps a copy of block 0.
+type imageWriter struct {
+	io.WriterAt
+	end    int64 // the end of the furthest write
+	block0 [BlockSize]byte
+}
+
+func (w *imageWriter) WriteAt(p []byte, off int64) (int, error) {
+	if err := w.zeroTo(off); err != nil {
+		return 0, err
+	}
+	n, err := w.WriterAt.WriteAt(p, off)
+	if off >= 0 && off < BlockSize {
+		copy(w.block0[off:], p[:n])
+	}
+	w.end = max(w.end, off+int64(n))
+	return n, err
+}
+
+var zeroBlock [BlockSize]byte
+
+// zeroTo writes zeros from the furthest write up to off, so that no old data of the destination stays in the image.
+func (w *imageWriter) zeroTo(off int64) error {
+	for w.end < off {
+		n, err := w.WriterAt.WriteAt(zeroBlock[:min(BlockSize, off-w.end)], w.end)
+		w.end += int64(n)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+// setSize writes zeros up to size, and truncates the destination if it can.
+func (w *imageWriter) setSize(size int64) error {
+	if err := w.zeroTo(size); err != nil {
+		return err
+	}
+
+	// A device cannot be truncated, but the zeros already make the image complete.
+	if t, ok := w.WriterAt.(interface{ Truncate(int64) error }); ok {
+		if err := t.Truncate(size); err != nil && !errors.Is(err, syscall.EINVAL) {
+			return err
 		}
 	}
 
@@ -514,10 +554,8 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			if _, err := w.dst.WriteAt(xattrs, inodeEnd); err != nil {
 				return fmt.Errorf("failed to write xattrs for %q: %w", path, err)
 			}
-			w.updateBlock0(inodeEnd, xattrs)
 			inodeEnd += int64(len(xattrs))
 		}
-		w.updateBlock0(off, inodeBytes)
 
 		// An inline inode has all of its data after it, and a tail-packed inode has only its tail.
 		if isInlined(ino) {
@@ -560,7 +598,6 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			if _, err := w.dst.WriteAt(inlineBuf, inlineOff); err != nil {
 				return fmt.Errorf("failed to write inline data for %q: %w", path, err)
 			}
-			w.updateBlock0(inlineOff, inlineBuf)
 		}
 	}
 
@@ -583,15 +620,18 @@ func (w *writer) writeData() error {
 		var rawBlockAddr uint32
 		var mode uint16
 		var nid uint32
+		var size int64
 		switch ino := ino.(type) {
 		case InodeCompact:
 			rawBlockAddr = ino.RawBlockAddr
 			mode = ino.Mode
 			nid = ino.Ino
+			size = int64(ino.Size)
 		case InodeExtended:
 			rawBlockAddr = ino.RawBlockAddr
 			mode = ino.Mode
 			nid = ino.Ino
+			size = int64(ino.Size)
 		default:
 			return fmt.Errorf("unsupported inode type %T", ino)
 		}
@@ -601,7 +641,8 @@ func (w *writer) writeData() error {
 			continue
 		}
 
-		data, size, err := w.dataForInode(path, ino)
+		// The file can change after the first pass, so copy only the size in the inode.
+		data, _, err := w.dataForInode(path, ino)
 		if err != nil {
 			return fmt.Errorf("failed to get data for %q: %w", path, err)
 		}
@@ -616,9 +657,12 @@ func (w *writer) writeData() error {
 				_, err = io.CopyN(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data, nblocks*BlockSize)
 			}
 		} else {
-			_, err = io.Copy(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data)
+			_, err = io.CopyN(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data, size)
 		}
 		_ = data.Close()
+		if errors.Is(err, io.EOF) {
+			err = fmt.Errorf("the file became shorter after the first pass: %w", err)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to write data for %q: %w", path, err)
 		}
@@ -1093,19 +1137,6 @@ func marshalInode(ino any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// updateBlock0 mirrors writes that land within the first block into the
-// shadow copy used for the superblock checksum.
-func (w *writer) updateBlock0(off int64, data []byte) {
-	if w.block0 == nil || len(data) == 0 || off < 0 || off >= BlockSize {
-		return
-	}
-	end := off + int64(len(data))
-	if end > BlockSize {
-		end = BlockSize
-	}
-	copy(w.block0[off:end], data[:end-off])
-}
-
 // checksumSuperBlock calculates the checksum from the superblock to the end of block 0.
 func (w *writer) checksumSuperBlock(sb *SuperBlock) error {
 	sbCopy := *sb
@@ -1119,14 +1150,9 @@ func (w *writer) checksumSuperBlock(sb *SuperBlock) error {
 	table := crc32.MakeTable(crc32.Castagnoli)
 	checksum := crc32.Checksum(marshalled.Bytes(), table)
 
-	// Include the rest of block 0 after the superblock, using the shadow
-	// copy of what was actually written there.
+	// The checksum also covers the rest of block 0 after the superblock.
 	tailStart := SuperBlockOffset + int64(marshalled.Len())
-	tail := make([]byte, BlockSize-tailStart)
-	if w.block0 != nil {
-		copy(tail, w.block0[tailStart:])
-	}
-	checksum = ^crc32.Update(checksum, table, tail)
+	checksum = ^crc32.Update(checksum, table, w.dst.block0[tailStart:])
 
 	sb.Checksum = checksum
 

@@ -11,9 +11,12 @@ package erofs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -143,4 +146,86 @@ func TestWriterLongSymlink(t *testing.T) {
 	got, err := fsys.ReadLink("link")
 	require.NoError(t, err)
 	require.Equal(t, target[:BlockSize-1], got)
+}
+
+func TestWriterDevice(t *testing.T) {
+	dev, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/null")
+	}
+	defer dev.Close()
+
+	testFS := fstest.MapFS{"f": &fstest.MapFile{Data: []byte("f"), Mode: 0o644}}
+	require.NoError(t, Create(dev, testFS))
+}
+
+// changedFS is a file system in which "f" has other data when it is opened than when it is walked.
+type changedFS struct {
+	fstest.MapFS
+	changed fstest.MapFS
+}
+
+func (c changedFS) Open(name string) (fs.File, error) {
+	if name == "f" {
+		return c.changed.Open(name)
+	}
+	return c.MapFS.Open(name)
+}
+
+func TestWriterFileGrows(t *testing.T) {
+	src := changedFS{
+		MapFS:   fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("g"), BlockSize), Mode: 0o644}},
+		changed: fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("G"), 3*BlockSize), Mode: 0o644}},
+	}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, src))
+	var sb SuperBlock
+	require.NoError(t, binary.Read(bytes.NewReader(buf.Bytes()[SuperBlockOffset:]), binary.LittleEndian, &sb))
+	require.Equal(t, int64(sb.Blocks)*BlockSize, int64(len(buf.Bytes())))
+
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	got, err := fs.ReadFile(fsys, "f")
+	require.NoError(t, err)
+	require.Equal(t, bytes.Repeat([]byte("G"), BlockSize), got)
+}
+
+func TestWriterFileShrinks(t *testing.T) {
+	src := changedFS{
+		MapFS:   fstest.MapFS{"f": &fstest.MapFile{Data: bytes.Repeat([]byte("g"), 3*BlockSize), Mode: 0o644}},
+		changed: fstest.MapFS{"f": &fstest.MapFile{Data: []byte("short"), Mode: 0o644}},
+	}
+
+	require.ErrorContains(t, Create(newBytesWriterAt(0), src), "became shorter")
+}
+
+func TestWriterReusedDestination(t *testing.T) {
+	// The files end in the middle of a block, so the image has gaps between the writes.
+	testFS := fstest.MapFS{
+		"a":   &fstest.MapFile{Data: []byte("a"), Mode: 0o644},
+		"b":   &fstest.MapFile{Data: bytes.Repeat([]byte("b"), BlockSize+1), Mode: 0o644},
+		"d/c": &fstest.MapFile{Data: []byte("c"), Mode: 0o644},
+	}
+	opts := []ErofsCreateOption{WithUUID([16]byte{1}), WithBuildTime(time.Unix(1, 0))}
+	want := newBytesWriterAt(0)
+	require.NoError(t, Create(want, testFS, opts...))
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "img"))
+	require.NoError(t, err)
+	defer f.Close()
+	_, err = f.Write(bytes.Repeat([]byte{0xaa}, 1<<20))
+	require.NoError(t, err)
+	require.NoError(t, Create(f, testFS, opts...))
+	got, err := os.ReadFile(f.Name())
+	require.NoError(t, err)
+
+	require.Len(t, got, len(want.Bytes()))
+	stale := 0
+	for i := range got {
+		if got[i] != want.Bytes()[i] {
+			stale++
+		}
+	}
+	require.Zero(t, stale, "bytes that differ from an image in an empty destination")
 }
