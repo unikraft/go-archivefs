@@ -455,9 +455,9 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 				continue
 			}
 
-			// The inline data must stay within the inode's block.
+			// Like in the reader, the inline data follows the inode and its xattrs, and must end in the block where it starts.
 			inlineOff := inodeEnd
-			blockEnd := (off/BlockSize + 1) * BlockSize
+			blockEnd := (inlineOff/BlockSize + 1) * BlockSize
 			if inlineOff+inlineSize > blockEnd {
 				_ = data.Close()
 				return fmt.Errorf("inline data would cross block boundary for %q: inode at %d, inline data %d-%d, block ends at %d",
@@ -958,10 +958,7 @@ func inlinePolicy(mode uint16, size, inodeSize int64) (inlined, tailPacked bool)
 		if nblocks > 0 && tailSize > 0 && tailSize <= MaxTailSize {
 			return false, true
 		}
-	case S_IFLNK:
-		// The reader reads a symlink target in one piece, so it is never tail-packed.
-		return nblocks == 0 && tailSize <= BlockSize-inodeSize, false
-	case S_IFDIR:
+	case S_IFDIR, S_IFLNK:
 		// The tail shares a block with the inode, so it must leave room for the inode.
 		if tailSize == 0 || tailSize > BlockSize-inodeSize {
 			return false, false

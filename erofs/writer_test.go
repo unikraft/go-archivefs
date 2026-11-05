@@ -244,10 +244,12 @@ func TestWriterLongSymlink(t *testing.T) {
 	fsys, err := Open(bytes.NewReader(buf.Bytes()))
 	require.NoError(t, err)
 
-	// Like Linux, the reader returns at most one block minus the terminating NUL.
+	fi, err := fsys.Lstat("link")
+	require.NoError(t, err)
+	require.Equal(t, uint16(InodeDataLayoutFlatInline), fi.Sys().(*Inode).DataLayout())
 	got, err := fsys.ReadLink("link")
 	require.NoError(t, err)
-	require.Equal(t, target[:BlockSize-1], got)
+	require.Equal(t, target[:maxSymlinkSize], got)
 }
 
 func TestWriterDevice(t *testing.T) {
