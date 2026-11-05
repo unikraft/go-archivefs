@@ -928,3 +928,85 @@ func TestWriterDirectoryNlink(t *testing.T) {
 		require.Equal(t, want, fi.Sys().(*Inode).Nlink(), name)
 	}
 }
+
+// inodeSys is a FileInfo.Sys() value with an inode number and a link count.
+type inodeSys struct{ ino, nlink uint64 }
+
+func (s inodeSys) GetIno() uint64   { return s.ino }
+func (s inodeSys) GetNlink() uint64 { return s.nlink }
+
+func TestWriterHardLinkLayout(t *testing.T) {
+	// The links get inodes of different sizes, and "aa" is written between them.
+	target := strings.Repeat("t", 4040)
+	data := bytes.Repeat([]byte("d"), BlockSize)
+	testFS := fstest.MapFS{
+		"a":  &fstest.MapFile{Data: []byte(target), Mode: fs.ModeSymlink | 0o777, Sys: inodeSys{7, 2}},
+		"aa": &fstest.MapFile{Data: data, Mode: 0o644},
+		"b":  &fstest.MapFile{Data: []byte(target), Mode: fs.ModeSymlink | 0o777, Sys: inodeSys{7, 2}, ModTime: time.Unix(1, 0)},
+	}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, testFS))
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	for _, name := range []string{"a", "b"} {
+		got, err := fsys.ReadLink(name)
+		require.NoError(t, err)
+		require.Equal(t, target, got, name)
+	}
+	got, err := fs.ReadFile(fsys, "aa")
+	require.NoError(t, err)
+	require.Equal(t, data, got)
+}
+
+func TestWriterSpecialFileHardLinks(t *testing.T) {
+	testFS := fstest.MapFS{
+		"fifo1": &fstest.MapFile{Mode: fs.ModeNamedPipe | 0o644, Sys: inodeSys{9, 2}},
+		"fifo2": &fstest.MapFile{Mode: fs.ModeNamedPipe | 0o644, Sys: inodeSys{9, 2}},
+	}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, testFS))
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	var nids []uint64
+	for _, name := range []string{"fifo1", "fifo2"} {
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, uint32(2), fi.Sys().(*Inode).Nlink(), name)
+		nids = append(nids, fi.Sys().(*Inode).Nid())
+	}
+	require.Equal(t, nids[0], nids[1])
+}
+
+func TestWriterInodeNumberCollision(t *testing.T) {
+	// Files on different devices can have the same inode number, but only files of one type are links.
+	data := bytes.Repeat([]byte("c"), 3*BlockSize)
+	zdata := bytes.Repeat([]byte("z"), 3*BlockSize+5)
+	testFS := fstest.MapFS{
+		"a":    &fstest.MapFile{Data: []byte("target"), Mode: fs.ModeSymlink | 0o777, Sys: inodeSys{7, 2}},
+		"c":    &fstest.MapFile{Data: data, Mode: 0o644},
+		"fifo": &fstest.MapFile{Mode: fs.ModeNamedPipe | 0o644, Sys: inodeSys{8, 2}},
+		"r":    &fstest.MapFile{Data: []byte("r"), Mode: 0o644, Sys: inodeSys{8, 2}},
+		"z":    &fstest.MapFile{Data: zdata, Mode: 0o644, Sys: inodeSys{7, 2}},
+	}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, testFS))
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	for name, want := range map[string][]byte{"c": data, "r": []byte("r"), "z": zdata} {
+		got, err := fs.ReadFile(fsys, name)
+		require.NoError(t, err, name)
+		require.Equal(t, want, got, name)
+	}
+	target, err := fsys.ReadLink("a")
+	require.NoError(t, err)
+	require.Equal(t, "target", target)
+	fi, err := fsys.Lstat("fifo")
+	require.NoError(t, err)
+	require.Equal(t, fs.ModeNamedPipe, fi.Mode().Type())
+}
