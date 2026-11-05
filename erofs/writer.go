@@ -679,7 +679,13 @@ func (w *writer) populateInodes() error {
 				return fmt.Errorf("failed to read directory entries: %w", err)
 			}
 
-			nlink = len(entries) + 2
+			// A directory has links from its parent, from "." and from each subdirectory.
+			nlink = 2
+			for _, e := range entries {
+				if e.IsDir() {
+					nlink++
+				}
+			}
 		} else {
 			nlink = int(archivefs.GetNlink(fi.Sys()))
 			ino := archivefs.GetIno(fi.Sys())

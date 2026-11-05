@@ -908,3 +908,23 @@ func TestWriterImageSize(t *testing.T) {
 		require.Equal(t, blocks(img)*BlockSize, int64(len(img)))
 	})
 }
+
+func TestWriterDirectoryNlink(t *testing.T) {
+	testFS := fstest.MapFS{
+		"a/b/f":  &fstest.MapFile{Data: []byte("f"), Mode: 0o644},
+		"a/c/f":  &fstest.MapFile{Data: []byte("f"), Mode: 0o644},
+		"a/f":    &fstest.MapFile{Data: []byte("f"), Mode: 0o644},
+		"a/link": &fstest.MapFile{Data: []byte("b"), Mode: fs.ModeSymlink | 0o777},
+	}
+
+	buf := newBytesWriterAt(0)
+	require.NoError(t, Create(buf, testFS, WithAllRoot(true)))
+	fsys, err := Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	for name, want := range map[string]uint32{".": 3, "a": 4, "a/b": 2, "a/c": 2} {
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, want, fi.Sys().(*Inode).Nlink(), name)
+	}
+}
