@@ -18,10 +18,47 @@ import (
 	"github.com/unikraft/go-archivefs"
 )
 
+// CreateOption is an option for Create.
+type CreateOption func(*createOptions)
+
+type createOptions struct {
+	allRoot  bool
+	fileInfo map[string]FileInfo
+}
+
+// FileInfo is the owner and the permission bits that WithFileInfoMap sets on
+// a file.
+type FileInfo struct {
+	Uid  int
+	Gid  int
+	Mode fs.FileMode
+}
+
+// WithAllRoot makes root:root the owner of all files. It has priority over
+// the owners from WithFileInfoMap.
+func WithAllRoot(allRoot bool) CreateOption {
+	return func(o *createOptions) {
+		o.allRoot = allRoot
+	}
+}
+
+// WithFileInfoMap sets the owner and the permission bits of each path in m,
+// with keys such as "/etc/passwd". All links to a file must get the same mode.
+func WithFileInfoMap(m map[string]FileInfo) CreateOption {
+	return func(o *createOptions) {
+		o.fileInfo = m
+	}
+}
+
 // Create writes the files of src to dst as an SVR4 archive, without the root
 // directory. CPIO cannot keep extended attributes, thus Create does not write them.
-func Create(dst io.Writer, src fs.FS) error {
-	members, err := collect(src)
+func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
+	var o createOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	members, err := collect(src, &o)
 	if err != nil {
 		return err
 	}
@@ -48,7 +85,7 @@ type member struct {
 
 // collect walks src and returns its entries with archive inode numbers and
 // link counts. It reads no file data.
-func collect(src fs.FS) ([]*member, error) {
+func collect(src fs.FS, o *createOptions) ([]*member, error) {
 	var (
 		members []*member
 		dirs    = map[string]*member{}
@@ -79,6 +116,14 @@ func collect(src fs.FS) ([]*member, error) {
 		}
 
 		sys := fi.Sys()
+		uid, gid := archivefs.GetUID(sys), archivefs.GetGID(sys)
+		if info, ok := o.fileInfo["/"+name]; ok {
+			uid, gid = info.Uid, info.Gid
+			mode = mode&^ModePerm | FileMode(info.Mode.Perm())
+		}
+		if o.allRoot {
+			uid, gid = 0, 0
+		}
 		m := &member{
 			name: name,
 			hdr: Header{
@@ -87,8 +132,8 @@ func collect(src fs.FS) ([]*member, error) {
 				Linkname: target,
 				Mode:     mode,
 				ModTime:  clampTime(fi.ModTime()),
-				Uid:      archivefs.GetUID(sys),
-				Guid:     archivefs.GetGID(sys),
+				Uid:      uid,
+				Guid:     gid,
 				Links:    1,
 			},
 		}
