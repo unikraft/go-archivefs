@@ -62,6 +62,7 @@ type writer struct {
 	inodes     map[string]any
 	inodeOrder []string
 	fileSizes  map[string]int64
+	xattrs     map[string][]byte // inline xattr area by path
 	linkMap    map[linkKey]inodeCount
 	linkKeys   map[string]linkKey // hard link group of each path with more than one link
 	opts       ErofsCreateOptions
@@ -253,10 +254,11 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 
 		key, linked := w.linkKeys[path]
 
-		// Decide the data layout: fully inline, tail-packed (only the tail inline) or plain.
-		inodeSize := int64(binary.Size(ino))
+		// The xattr area follows the inode core, and inline data follows both.
+		inodeSize := int64(binary.Size(ino)) + int64(len(w.xattrs[path]))
 		nblocks := size / BlockSize
 		tailSize := size % BlockSize
+		// Decide the data layout: fully inline, tail-packed (only the tail inline) or plain.
 		inlined, useTailPacking := inlinePolicy(mode, size, inodeSize)
 
 		// Subsequent occurrences of a hard link reuse the first occurrence's
@@ -410,11 +412,10 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			return metaSize, dataSize, fmt.Errorf("unsupported inode type %T", ino)
 		}
 
-		metaSize += int64(binary.Size(ino))
+		metaSize += inodeSize
 
 		if inlined {
 			metaSize += size
-			metaSize = roundUp(metaSize, InodeSlotSize)
 		} else if shouldAllocate {
 			// Only allocate data space for the first occurrence of each
 			// hardlinked file, and every directory.
@@ -423,12 +424,12 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				// inode in the metadata area.
 				dataSize += nblocks * BlockSize
 				metaSize += tailSize
-				metaSize = roundUp(metaSize, InodeSlotSize)
 			} else {
 				dataSize += size
 				dataSize = roundUp(dataSize, BlockSize)
 			}
 		}
+		metaSize = roundUp(metaSize, InodeSlotSize)
 	}
 
 	metaSize = roundUp(metaSize, BlockSize)
@@ -507,6 +508,14 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			return fmt.Errorf("failed to write inode for %q: %w", path, err)
 		}
 
+		inodeEnd := off + int64(len(inodeBytes))
+		if xattrs := w.xattrs[path]; len(xattrs) > 0 {
+			if _, err := w.dst.WriteAt(xattrs, inodeEnd); err != nil {
+				return fmt.Errorf("failed to write xattrs for %q: %w", path, err)
+			}
+			inodeEnd += int64(len(xattrs))
+		}
+
 		// Fully inlined files store all their data alongside the inode;
 		// tail-packed files store only the final partial block there.
 		if isInlined(ino) {
@@ -533,7 +542,7 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			}
 
 			// The inline data must stay within the inode's block.
-			inlineOff := off + int64(len(inodeBytes))
+			inlineOff := inodeEnd
 			blockEnd := (off/BlockSize + 1) * BlockSize
 			if inlineOff+inlineSize > blockEnd {
 				_ = data.Close()
@@ -625,6 +634,7 @@ func (w *writer) populateInodes() error {
 	w.inodes = map[string]any{}
 	w.fileSizes = map[string]int64{}
 	w.linkKeys = map[string]linkKey{}
+	w.xattrs = map[string][]byte{}
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -678,7 +688,19 @@ func (w *writer) populateInodes() error {
 			}
 		}
 
-		w.inodes[path] = toInode(fi, nlink, w.opts.allRoot, originalFInfo)
+		xattrs, err := archivefs.GetXattrs(fi.Sys())
+		if err != nil {
+			return fmt.Errorf("failed to get xattrs of %q: %w", path, err)
+		}
+		ibody, err := encodeXattrs(xattrs)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if ibody != nil {
+			w.xattrs[path] = ibody
+		}
+
+		w.inodes[path] = toInode(fi, nlink, xattrCount(ibody), w.opts.allRoot, originalFInfo)
 		w.inodeOrder = append(w.inodeOrder, path)
 		w.fileSizes[path] = fi.Size()
 
@@ -826,7 +848,7 @@ func (w *writer) findInodeAtPath(path string) (uint64, error) {
 	return uint64(nid), nil
 }
 
-func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) any {
+func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo) any {
 	var uid, gid int
 	mode := fi.Mode()
 
@@ -863,6 +885,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 	if compact {
 		return InodeCompact{
 			Format:       setBits(0, InodeLayoutCompact, InodeLayoutBit, InodeLayoutBits),
+			XattrCount:   icount,
 			Mode:         statModeFromFileMode(mode),
 			Nlink:        uint16(nlink),
 			UID:          uint16(uid),
@@ -873,6 +896,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 
 	return InodeExtended{
 		Format:       setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
+		XattrCount:   icount,
 		Mode:         statModeFromFileMode(mode),
 		Nlink:        uint32(nlink),
 		UID:          uint32(uid),

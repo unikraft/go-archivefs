@@ -942,3 +942,32 @@ func TestTarFSPathTraversal(t *testing.T) {
 		require.Equal(t, "safe.txt", entries[0].Name())
 	})
 }
+
+func TestTarFSCreateXattrs(t *testing.T) {
+	xattrs := map[string]string{"security.capability": "\x01\x00\x00\x02", "user.a": "x", "user.b=c": "y"}
+	var src bytes.Buffer
+	tw := tar.NewWriter(&src)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag:   tar.TypeReg,
+		Name:       "f",
+		Mode:       0o644,
+		Size:       1,
+		PAXRecords: map[string]string{"SCHILY.xattr.security.capability": xattrs["security.capability"], "SCHILY.xattr.user.a": "x", "SCHILY.xattr.user.b%3Dc": "y"},
+	}))
+	_, err := tw.Write([]byte("f"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	srcFS, err := tarfs.Open(bytes.NewReader(src.Bytes()))
+	require.NoError(t, err)
+	var dst bytes.Buffer
+	require.NoError(t, tarfs.Create(&dst, srcFS))
+
+	dstFS, err := tarfs.Open(bytes.NewReader(dst.Bytes()))
+	require.NoError(t, err)
+	fi, err := fs.Stat(dstFS, "f")
+	require.NoError(t, err)
+	got, err := fi.Sys().(*tarfs.FileHeader).GetXattrs()
+	require.NoError(t, err)
+	require.Equal(t, xattrs, got)
+}
