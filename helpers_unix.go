@@ -31,6 +31,14 @@ func GetIno(sys any) uint64 {
 	return 0
 }
 
+// GetDev returns the ID of the device that holds the file (st_dev), or 0 if sys does not give it.
+func GetDev(sys any) uint64 {
+	if v, ok := sys.(*syscall.Stat_t); ok {
+		return uint64(v.Dev)
+	}
+	return 0
+}
+
 // GetNlink returns the hard-link count from a FileInfo.Sys() value.
 // It supports *syscall.Stat_t, *tar.Header (always 1), and any type
 // implementing [InodeInfo].

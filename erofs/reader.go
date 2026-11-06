@@ -46,6 +46,13 @@ const (
 	SuperBlockMagicV1 = 0xe0f5e1e2
 	SuperBlockOffset  = 1024
 
+	// Block sizes from 512 bytes to 64 KiB. Linux mounts only block sizes up to its page size.
+	minBlockSizeBits = 9
+	maxBlockSizeBits = 16
+
+	// Like Linux on 4 KiB pages, page_get_link() cuts symlink targets at PAGE_SIZE-1 bytes.
+	maxSymlinkSize = 4095
+
 	// Inode slot size in bit shift.
 	InodeSlotBits = 5
 
@@ -72,6 +79,7 @@ const (
 const (
 	InodeDataLayoutFlatPlain = iota
 	InodeDataLayoutFlatCompressionLegacy
+	// FlatInline keeps all the data, or the tail after the full blocks, right after the inode.
 	InodeDataLayoutFlatInline
 	InodeDataLayoutFlatCompression
 	InodeDataLayoutChunkBased
@@ -225,6 +233,10 @@ func (i *Image) initSuperBlock() error {
 		return fmt.Errorf("unknown magic: 0x%x", i.sb.Magic)
 	}
 
+	if i.sb.BlockSizeBits < minBlockSizeBits || i.sb.BlockSizeBits > maxBlockSizeBits {
+		return fmt.Errorf("unsupported block size: 2^%d", i.sb.BlockSizeBits)
+	}
+
 	if err := i.verifyChecksum(); err != nil {
 		return err
 	}
@@ -253,8 +265,11 @@ func (i *Image) verifyChecksum() error {
 	table := crc32.MakeTable(crc32.Castagnoli)
 	checksum := crc32.Checksum(marshalledSb.Bytes(), table)
 
+	// Like in Linux, the checksum covers the bytes from the superblock to the end of its block.
+	blockSize := int64(i.BlockSize())
+	end := (SuperBlockOffset/blockSize + 1) * blockSize
 	off := SuperBlockOffset + int64(binary.Size(i.sb))
-	if buf, err := i.bytesAt(off, int64(i.BlockSize())-off); err != nil {
+	if buf, err := i.bytesAt(off, end-off); err != nil {
 		return fmt.Errorf("failed to read checksum block: %w", err)
 	} else {
 		checksum = ^crc32.Update(checksum, table, buf)
@@ -262,33 +277,6 @@ func (i *Image) verifyChecksum() error {
 	if checksum != i.sb.Checksum {
 		return fmt.Errorf("invalid checksum: 0x%x, expected: 0x%x", checksum, i.sb.Checksum)
 	}
-
-	return nil
-}
-
-// checksum populates the checksum of the superblock, it assumes the remainder
-// of the block contains all zeroes.
-func (sb *SuperBlock) checksum() error {
-	sbCopy := *sb
-	sbCopy.Checksum = 0
-
-	// Marshal the superblock into a byte buffer.
-	var marshalled bytes.Buffer
-	if err := binary.Write(&marshalled, binary.LittleEndian, sbCopy); err != nil {
-		return err
-	}
-
-	// Create a CRC32C table and calculate the checksum over the marshalled superblock.
-	table := crc32.MakeTable(crc32.Castagnoli)
-	checksum := crc32.Checksum(marshalled.Bytes(), table)
-
-	// Calculate the remaining bytes in the block after the superblock
-	// (assume all zeroes for now).
-	off := SuperBlockOffset + int64(binary.Size(sb))
-	remainingBytes := make([]byte, BlockSize-off)
-	checksum = ^crc32.Update(checksum, table, remainingBytes)
-
-	sb.Checksum = checksum
 
 	return nil
 }
@@ -420,14 +408,23 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 
 	switch dataLayout := inode.DataLayout(); dataLayout {
 	case InodeDataLayoutFlatInline:
-		// Check that whether the file data in the last block fits into
-		// the remaining room of the metadata block.
 		tailSize := int64(inode.size) & (blockSize - 1)
-		if tailSize == 0 || tailSize > blockSize-inodeSize {
-			return Inode{}, fmt.Errorf("inline data not found or cross block boundary at inode %d, tail size: %d",
+
+		// For fully inline files, tailSize could be 0 (empty files) or the entire file size
+		if inode.size > 0 && tailSize == 0 {
+			return Inode{}, fmt.Errorf("non-empty file with no tail using flat inline at inode %d, size: %d",
+				nid, inode.size)
+		}
+
+		// For tail-packing, we need a non-zero tail that fits in the metadata block
+		if tailSize > blockSize-inodeSize {
+			return Inode{}, fmt.Errorf("inline data would cross block boundary at inode %d, tail size: %d",
 				nid, tailSize)
 		}
-		inode.idataOff = off + inodeSize
+
+		if inode.size > 0 {
+			inode.idataOff = off + inodeSize
+		}
 		fallthrough
 
 	case InodeDataLayoutFlatPlain:
@@ -904,24 +901,13 @@ func (ino *Inode) Readlink() (string, error) {
 	if !ino.IsSymlink() {
 		return "", fs.ErrInvalid
 	}
-	off := int64(ino.dataOff)
-	size := int64(ino.size)
-	if ino.idataOff != 0 {
-		// Inline symlink data shouldn't cross block boundary.
-		if ino.blocks > 1 {
-			return "", fmt.Errorf("inline data cross block boundary at inode %d", ino.Nid())
-		}
-		off = int64(ino.idataOff)
-	} else {
-		// This matches Linux's behaviour in fs/namei.c:page_get_link() and
-		// include/linux/namei.h:nd_terminate_link().
-		if size > int64(ino.image.BlockSize())-1 {
-			size = int64(ino.image.BlockSize()) - 1
-		}
-	}
-	target, err := ino.image.bytesAt(off, size)
+	data, err := ino.Data()
 	if err != nil {
 		return "", err
+	}
+	target := make([]byte, min(ino.size, maxSymlinkSize))
+	if _, err := io.ReadFull(data, target); err != nil {
+		return "", fmt.Errorf("failed to read the symlink target of inode %d: %w", ino.Nid(), err)
 	}
 	return string(target), nil
 }
