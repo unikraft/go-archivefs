@@ -128,6 +128,79 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+func TestCreateOptions(t *testing.T) {
+	owner := &cpio.Header{Uid: 1000, Guid: 1000}
+	src := fstest.MapFS{
+		"etc":        {Mode: fs.ModeDir | 0o755, Sys: owner},
+		"etc/shadow": {Mode: fs.ModeSetgid | 0o644, Data: []byte("x"), Sys: owner},
+	}
+	fileInfo := cpio.WithFileInfoMap(map[string]cpio.FileInfo{
+		"/etc/shadow": {Uid: 0, Gid: 42, Mode: 0o640},
+	})
+
+	type entry struct {
+		mode     cpio.FileMode
+		uid, gid int
+	}
+	tests := []struct {
+		desc string
+		opts []cpio.CreateOption
+		want map[string]entry
+	}{
+		{
+			desc: "no options",
+			want: map[string]entry{
+				"./etc":        {cpio.TypeDir | 0o755, 1000, 1000},
+				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o644, 1000, 1000},
+			},
+		},
+		{
+			desc: "file info map",
+			opts: []cpio.CreateOption{fileInfo},
+			want: map[string]entry{
+				"./etc":        {cpio.TypeDir | 0o755, 1000, 1000},
+				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o640, 0, 42},
+			},
+		},
+		{
+			desc: "all root and file info map",
+			opts: []cpio.CreateOption{cpio.WithAllRoot(true), fileInfo},
+			want: map[string]entry{
+				"./etc":        {cpio.TypeDir | 0o755, 0, 0},
+				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o640, 0, 0},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		var buf bytes.Buffer
+		if err := cpio.Create(&buf, src, tt.opts...); err != nil {
+			t.Fatalf("%s: Create: %v", tt.desc, err)
+		}
+
+		got := map[string]entry{}
+		r := cpio.NewReader(&buf)
+		for {
+			hdr, err := r.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("%s: Next: %v", tt.desc, err)
+			}
+			got[hdr.Name] = entry{hdr.Mode, hdr.Uid, hdr.Guid}
+		}
+		if len(got) != len(tt.want) {
+			t.Fatalf("%s: got %+v, want %+v", tt.desc, got, tt.want)
+		}
+		for name, want := range tt.want {
+			if got[name] != want {
+				t.Errorf("%s: %s = %+v, want %+v", tt.desc, name, got[name], want)
+			}
+		}
+	}
+}
+
 func TestCreateErrors(t *testing.T) {
 	// a-big fills the write buffer before the bad entry. Thus an entry check
 	// after the first write puts bytes in dst.
