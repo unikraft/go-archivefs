@@ -10,6 +10,13 @@ Copyright:
 License: MIT
 
 Files:
+ cpio/*
+Copyright:
+ Copyright (c) 2017, Ryan Armstrong.
+ Copyright (c) 2026, Unikraft GmbH.
+License: BSD-3-Clause
+
+Files:
  erofs/erofs.go
  erofs/reader.go
 Copyright:
