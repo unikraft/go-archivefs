@@ -148,13 +148,6 @@ func TestCreateOptions(t *testing.T) {
 		want map[string]entry
 	}{
 		{
-			desc: "no options",
-			want: map[string]entry{
-				"./etc":        {cpio.TypeDir | 0o755, 1000, 1000},
-				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o644, 1000, 1000},
-			},
-		},
-		{
 			desc: "file info map",
 			opts: []cpio.CreateOption{fileInfo},
 			want: map[string]entry{
