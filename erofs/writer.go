@@ -33,10 +33,6 @@ const (
 	BlockSize     = 4096
 	BlockSizeBits = 12
 	InodeSlotSize = 1 << InodeSlotBits
-	// MaxInlineDataSize is the largest regular file stored inline; 0 keeps file data aligned for DAX.
-	MaxInlineDataSize = 0
-	// MaxTailSize is the largest regular file tail stored inline; 0 keeps file data aligned for DAX.
-	MaxTailSize = 0
 )
 
 // Create creates an EROFS filesystem image from the source filesystem and writes
@@ -823,13 +819,6 @@ func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFIn
 }
 
 func encodeDirents(dirents []Dirent, names []string) ([]byte, error) {
-	if len(dirents) == 0 {
-		return nil, fmt.Errorf("encodeDirents called with empty dirents slice")
-	}
-	if len(dirents) != len(names) {
-		return nil, fmt.Errorf("encodeDirents: dirents and names length mismatch (%d vs %d)", len(dirents), len(names))
-	}
-
 	blocks := splitIntoDirentBlocks(dirents, names)
 
 	var buf bytes.Buffer
@@ -930,18 +919,7 @@ func dataLayout(ino any) uint16 {
 	return InodeDataLayoutFlatPlain
 }
 
-// inlinePolicy decides how an inode's data is laid out. It returns
-// inlined=true when all the data is stored with the inode metadata (no data
-// blocks), tailPacked=true when the full blocks go to the data area and only
-// the tail (size % BlockSize) is stored with the inode. When both are false
-// the data lives entirely in the data area (flat plain).
-//
-// Regular file data is only inlined within the MaxInlineDataSize /
-// MaxTailSize thresholds (currently 0: inline file data is incompatible with
-// DAX, which requires block-aligned file data). Directory and symlink data is
-// never mapped through DAX and is always inlined when it fits in the inode's
-// block — matching mkfs.erofs, whose '-E noinline_data' option only affects
-// regular files.
+// inlinePolicy decides the data layout of an inode. Like with mkfs.erofs -E noinline_data, regular file data is never inline.
 func inlinePolicy(mode uint16, size, inodeSize int64) (inlined, tailPacked bool) {
 	if size == 0 {
 		return false, false
@@ -951,13 +929,6 @@ func inlinePolicy(mode uint16, size, inodeSize int64) (inlined, tailPacked bool)
 	tailSize := size % BlockSize
 
 	switch mode & S_IFMT {
-	case S_IFREG:
-		if size <= MaxInlineDataSize {
-			return true, false
-		}
-		if nblocks > 0 && tailSize > 0 && tailSize <= MaxTailSize {
-			return false, true
-		}
 	case S_IFDIR, S_IFLNK:
 		// The tail shares a block with the inode, so it must leave room for the inode.
 		if tailSize == 0 || tailSize > BlockSize-inodeSize {
