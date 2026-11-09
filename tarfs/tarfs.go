@@ -19,6 +19,8 @@ import (
 	"path"
 	"slices"
 	"strings"
+
+	"github.com/unikraft/go-archivefs"
 )
 
 var (
@@ -524,8 +526,8 @@ func (fi *fileInfo) Sys() any {
 
 // FileHeader is returned by FileInfo.Sys() for files in a tarfs filesystem.
 // It carries the original tar header along with synthetic inode metadata
-// assigned during archive parsing. It implements [archivefs.InodeInfo] and
-// [archivefs.OwnerInfo].
+// assigned during archive parsing. It implements [archivefs.InodeInfo],
+// [archivefs.OwnerInfo], [archivefs.DevInfo] and [archivefs.XattrInfo].
 type FileHeader struct {
 	*tar.Header
 	ino   uint64
@@ -536,6 +538,10 @@ func (fh *FileHeader) GetIno() uint64   { return fh.ino }
 func (fh *FileHeader) GetNlink() uint64 { return fh.nlink }
 func (fh *FileHeader) GetUID() int      { return fh.Header.Uid }
 func (fh *FileHeader) GetGID() int      { return fh.Header.Gid }
+
+// GetXattrs implements [archivefs.XattrInfo].
+func (fh *FileHeader) GetXattrs() (map[string]string, error) { return archivefs.GetXattrs(fh.Header) }
+
 func (fh *FileHeader) GetDevMajor() uint32 {
 	if fh.Header.Devmajor < 0 {
 		return 0

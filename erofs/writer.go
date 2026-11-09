@@ -59,6 +59,7 @@ type writer struct {
 	inodes     map[string]any
 	inodeOrder []string
 	fileSizes  map[string]int64
+	xattrs     map[string][]byte // inline xattr area by path
 	linkMap    map[uint64]inodeCount
 	opts       ErofsCreateOptions
 }
@@ -187,6 +188,9 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			size = sz
 		}
 
+		// The xattr area follows the inode core, and inline data follows both.
+		inodeSize := int64(binary.Size(ino)) + int64(len(w.xattrs[path]))
+
 		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
 		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
 		inlined := size > 0 && size <= MaxInlineDataSize
@@ -194,7 +198,7 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			// if the size of the inode and data exceeds the block size, we need to
 			// pad to the next block boundary before inlining the data.
 			spaceAvailable := roundUp(metaSize, BlockSize) - metaSize
-			if spaceAvailable > 0 && int64(binary.Size(ino))+size > spaceAvailable {
+			if spaceAvailable > 0 && inodeSize+size > spaceAvailable {
 				// Pad the metadata to the next block boundary.
 				metaSize = roundUp(metaSize, BlockSize)
 			}
@@ -343,17 +347,17 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			return metaSize, dataSize, fmt.Errorf("unsupported inode type %T", ino)
 		}
 
-		metaSize += int64(binary.Size(ino))
+		metaSize += inodeSize
 
 		if inlined {
 			metaSize += size
-			metaSize = roundUp(metaSize, InodeSlotSize)
 		} else if shouldAllocate {
 			// Only allocate data space for the first occurrence of each
 			// hardlinked file, and every directory.
 			dataSize += size
 			dataSize = roundUp(dataSize, BlockSize)
 		}
+		metaSize = roundUp(metaSize, InodeSlotSize)
 	}
 
 	metaSize = roundUp(metaSize, BlockSize)
@@ -393,6 +397,9 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 }
 
 func (w *writer) writeMetadata(metaBlockAddr int64) error {
+	// Hard links share one inode: write it and its xattrs once, from the first link that firstPass gave a slot.
+	writtenInodes := make(map[uint32]bool)
+
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
@@ -406,12 +413,25 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			return fmt.Errorf("unsupported inode type %T", ino)
 		}
 
+		if writtenInodes[nid] {
+			continue
+		}
+		writtenInodes[nid] = true
+
 		// Get the address of the inode.
 		off := metaBlockAddr*BlockSize + int64(nid)*InodeSlotSize
 
 		// Write the inode.
 		if err := binary.Write(io.NewOffsetWriter(w.dst, off), binary.LittleEndian, ino); err != nil {
 			return fmt.Errorf("failed to write inode for %q: %w", path, err)
+		}
+
+		inodeEnd := off + int64(binary.Size(ino))
+		if xattrs := w.xattrs[path]; len(xattrs) > 0 {
+			if _, err := w.dst.WriteAt(xattrs, inodeEnd); err != nil {
+				return fmt.Errorf("failed to write xattrs for %q: %w", path, err)
+			}
+			inodeEnd += int64(len(xattrs))
 		}
 
 		// Small files are stored in the inline with the inode.
@@ -422,7 +442,7 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			}
 
 			// Write the inlined data.
-			_, err = io.Copy(io.NewOffsetWriter(w.dst, off+int64(binary.Size(ino))), data)
+			_, err = io.Copy(io.NewOffsetWriter(w.dst, inodeEnd), data)
 			_ = data.Close()
 			if err != nil {
 				return fmt.Errorf("failed to write inline data for %q: %w", path, err)
@@ -493,6 +513,7 @@ func (w *writer) writeData() error {
 func (w *writer) populateInodes() error {
 	w.inodes = map[string]any{}
 	w.fileSizes = map[string]int64{}
+	w.xattrs = map[string][]byte{}
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -538,7 +559,19 @@ func (w *writer) populateInodes() error {
 			}
 		}
 
-		w.inodes[path] = toInode(fi, nlink, w.opts.allRoot, originalFInfo)
+		xattrs, err := archivefs.GetXattrs(fi.Sys())
+		if err != nil {
+			return fmt.Errorf("failed to get xattrs of %q: %w", path, err)
+		}
+		ibody, err := encodeXattrs(xattrs)
+		if err != nil {
+			return fmt.Errorf("failed to encode xattrs of %q: %w", path, err)
+		}
+		if ibody != nil {
+			w.xattrs[path] = ibody
+		}
+
+		w.inodes[path] = toInode(fi, nlink, xattrCount(ibody), w.opts.allRoot, originalFInfo)
 		w.inodeOrder = append(w.inodeOrder, path)
 		w.fileSizes[path] = fi.Size()
 
@@ -686,7 +719,7 @@ func (w *writer) findInodeAtPath(path string) (uint64, error) {
 	return uint64(nid), nil
 }
 
-func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) any {
+func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo) any {
 	var uid, gid int
 	mode := fi.Mode()
 
@@ -722,6 +755,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 	if compact {
 		return InodeCompact{
 			Format:       setBits(0, InodeLayoutCompact, InodeLayoutBit, InodeLayoutBits),
+			XattrCount:   icount,
 			Mode:         statModeFromFileMode(mode),
 			Nlink:        uint16(nlink),
 			UID:          uint16(uid),
@@ -732,6 +766,7 @@ func toInode(fi fs.FileInfo, nlink int, allRoot bool, originalFInfo *FileInfo) a
 
 	return InodeExtended{
 		Format:       setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
+		XattrCount:   icount,
 		Mode:         statModeFromFileMode(mode),
 		Nlink:        uint32(nlink),
 		UID:          uint32(uid),
