@@ -12,15 +12,17 @@ package erofs
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"math"
-	"os"
 	stdpath "path"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,9 +33,6 @@ const (
 	BlockSize     = 4096
 	BlockSizeBits = 12
 	InodeSlotSize = 1 << InodeSlotBits
-	// MaxInlineDataSize = BlockSize / 4
-	// We change this to 0 to represent the flag '-E noinline_data'
-	MaxInlineDataSize = 0
 )
 
 // Create creates an EROFS filesystem image from the source filesystem and writes
@@ -41,7 +40,7 @@ const (
 func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 	w := &writer{
 		src: src,
-		dst: dst,
+		dst: &imageWriter{WriterAt: dst},
 	}
 
 	for _, opt := range opts {
@@ -55,25 +54,29 @@ func Create(dst io.WriterAt, src fs.FS, opts ...ErofsCreateOption) error {
 
 type writer struct {
 	src        fs.FS
-	dst        io.WriterAt
+	dst        *imageWriter
 	inodes     map[string]any
 	inodeOrder []string
 	fileSizes  map[string]int64
-	xattrs     map[string][]byte // inline xattr area by path
-	linkMap    map[uint64]inodeCount
+	xattrs     map[string][]byte     // inline xattr area by path
+	links      map[string]*linkGroup // hard link group of each path with more than one link
 	opts       ErofsCreateOptions
 }
 
-type inodeCount struct {
-	Count        int
-	Nlink        int // The number of links to this inode in the source tree
-	Inode        uint64
-	RawBlockAddr uint32 // The block address for the first occurrence of this hardlink
+// linkKey identifies a hard link group by device, inode number and type, like the Linux initramfs unpacker.
+type linkKey struct {
+	dev uint64
+	ino uint64
+	typ uint16
+}
+
+// linkGroup is a hard link group, whose paths share one inode.
+type linkGroup struct {
+	nlink int    // the number of links in the source tree
+	first string // the first path that firstPass gave an inode
 }
 
 func (w *writer) write() error {
-	w.linkMap = map[uint64]inodeCount{}
-
 	if err := w.populateInodes(); err != nil {
 		return fmt.Errorf("failed to populate inodes: %w", err)
 	}
@@ -83,8 +86,8 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to calculate metadata and data size: %w", err)
 	}
 
-	// Reserve the first block for the superblock.
-	metaBlockAddr := int64(1)
+	// Metadata starts at block 0 and shares it with the superblock, like mkfs.erofs.
+	metaBlockAddr := int64(0)
 
 	if err := w.writeMetadata(metaBlockAddr); err != nil {
 		return fmt.Errorf("failed to write metadata blocks: %w", err)
@@ -125,12 +128,23 @@ func (w *writer) write() error {
 		buildTime = *w.opts.buildTime
 	}
 
+	// Hard links share one inode, so count the inodes and not the paths.
+	uniqueInodes := make(map[uint32]bool)
+	for _, path := range w.inodeOrder {
+		switch ino := w.inodes[path].(type) {
+		case InodeCompact:
+			uniqueInodes[ino.Ino] = true
+		case InodeExtended:
+			uniqueInodes[ino.Ino] = true
+		}
+	}
+
 	sb := SuperBlock{
 		Magic:         SuperBlockMagicV1,
 		BlockSizeBits: BlockSizeBits,
 		RootNid:       rootNid,
-		Inodes:        uint64(len(w.inodes)),
-		Blocks:        uint32(1 + (metaSize+dataSize)/BlockSize),
+		Inodes:        uint64(len(uniqueInodes)),
+		Blocks:        uint32((metaSize + dataSize) / BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
 		UUID:          sbUUID,
 		BuildTime:     uint64(buildTime.Unix()),
@@ -139,7 +153,7 @@ func (w *writer) write() error {
 		// TODO: other fields (volume name, etc.)
 	}
 
-	if err := sb.checksum(); err != nil {
+	if err := w.checksumSuperBlock(&sb); err != nil {
 		return fmt.Errorf("failed to calculate superblock checksum: %w", err)
 	}
 
@@ -147,9 +161,59 @@ func (w *writer) write() error {
 		return fmt.Errorf("failed to write superblock: %w", err)
 	}
 
-	if f, ok := w.dst.(*os.File); ok {
-		if err := f.Truncate(int64(sb.Blocks) * BlockSize); err != nil {
-			return fmt.Errorf("failed to truncate destination file: %w", err)
+	if err := w.dst.setSize(int64(sb.Blocks) * BlockSize); err != nil {
+		return fmt.Errorf("failed to set the image size: %w", err)
+	}
+
+	return nil
+}
+
+// imageWriter writes the image, writes zeros in the gaps between writes, and keeps a copy of block 0.
+type imageWriter struct {
+	io.WriterAt
+	end    int64 // the end of the furthest write
+	block0 [BlockSize]byte
+}
+
+func (w *imageWriter) WriteAt(p []byte, off int64) (int, error) {
+	if err := w.zeroTo(off); err != nil {
+		return 0, err
+	}
+	n, err := w.WriterAt.WriteAt(p, off)
+	if off >= 0 && off < BlockSize {
+		copy(w.block0[off:], p[:n])
+	}
+	w.end = max(w.end, off+int64(n))
+	return n, err
+}
+
+var zeroBlock [BlockSize]byte
+
+// zeroTo writes zeros from the furthest write up to off, so that no old data of the destination stays in the image.
+func (w *imageWriter) zeroTo(off int64) error {
+	for w.end < off {
+		n, err := w.WriterAt.WriteAt(zeroBlock[:min(BlockSize, off-w.end)], w.end)
+		w.end += int64(n)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+// setSize writes zeros up to size, and truncates the destination if it can.
+func (w *imageWriter) setSize(size int64) error {
+	if err := w.zeroTo(size); err != nil {
+		return err
+	}
+
+	// A device cannot be truncated, but the zeros already make the image complete.
+	if t, ok := w.WriterAt.(interface{ Truncate(int64) error }); ok {
+		if err := t.Truncate(size); err != nil && !errors.Is(err, syscall.EINVAL) {
+			return err
 		}
 	}
 
@@ -158,7 +222,17 @@ func (w *writer) write() error {
 
 // firstPass precomputes the layout of the blocks, and inodes.
 func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
+	// The inodes start in block 0, after the superblock.
+	metaSize = roundUp(SuperBlockOffset+int64(binary.Size(SuperBlock{})), InodeSlotSize)
+
 	for _, path := range w.inodeOrder {
+		// The other links of a group use the inode of the first link: they use no metadata slot and no data blocks.
+		group := w.links[path]
+		if group != nil && group.first != "" {
+			w.inodes[path] = w.inodes[group.first]
+			continue
+		}
+
 		ino := w.inodes[path]
 
 		// For regular files, use the cached size from populateInodes to avoid
@@ -188,18 +262,26 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			size = sz
 		}
 
-		// The xattr area follows the inode core, and inline data follows both.
-		inodeSize := int64(binary.Size(ino)) + int64(len(w.xattrs[path]))
+		// Special files have no data, and keep the device number that toInode put in RawBlockAddr.
+		special := isSpecialFile(mode)
+		if special {
+			size = 0
+		}
 
-		// Avoid inlining empty files: the reader expects tailSize != 0 for inline
-		// layout, and MaxInlineDataSize=0 is used to represent '-E noinline_data'.
-		inlined := size > 0 && size <= MaxInlineDataSize
-		if inlined {
-			// if the size of the inode and data exceeds the block size, we need to
-			// pad to the next block boundary before inlining the data.
-			spaceAvailable := roundUp(metaSize, BlockSize) - metaSize
-			if spaceAvailable > 0 && inodeSize+size > spaceAvailable {
-				// Pad the metadata to the next block boundary.
+		// Decide the data layout: fully inline, tail-packed (only the tail inline) or plain.
+		inodeSize := int64(binary.Size(ino)) + int64(len(w.xattrs[path]))
+		nblocks := size / BlockSize
+		tailSize := size % BlockSize
+		inlined, useTailPacking := inlinePolicy(mode, size, inodeSize)
+
+		// The inode, its xattrs and its inline data must not cross a block boundary, so they start in the next block if they would.
+		if inlined || useTailPacking {
+			inlineSize := size
+			if useTailPacking {
+				inlineSize = tailSize
+			}
+			spaceInCurrentBlock := roundUp(metaSize, BlockSize) - metaSize
+			if spaceInCurrentBlock > 0 && inodeSize+inlineSize > spaceInCurrentBlock {
 				metaSize = roundUp(metaSize, BlockSize)
 			}
 		}
@@ -210,136 +292,37 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 			return metaSize, dataSize, fmt.Errorf("failed to convert offset to inode number: %w", err)
 		}
 
-		// Track if this is the first occurrence of a hardlinked file
-		shouldAllocate := false
-		rawBlockAssigned := false
+		// Tail-packed data keeps its full blocks in the data area, and the tail with the inode.
+		layout := uint16(InodeDataLayoutFlatPlain)
+		if inlined || useTailPacking {
+			layout = InodeDataLayoutFlatInline
+		}
+		if group != nil {
+			group.first = path
+		}
 
 		switch ino := ino.(type) {
 		case InodeCompact:
-			if ino.Mode&S_IFMT == S_IFDIR {
-				ino.Ino = nid
-				ino.Size = uint32(size)
-				shouldAllocate = true
-			} else if isSpecialFile(ino.Mode) {
-				// Device files, FIFOs, and sockets have no file data.
-				ino.Ino = nid
-				ino.Size = 0
-				rawBlockAssigned = true
-			} else {
-				// Handle all non-directory files with hardlink deduplication
-				fsys, ok := w.src.(fs.ReadLinkFS)
-				if !ok {
-					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
-				}
-
-				info, err := fsys.Lstat(path)
-				if err != nil {
-					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
-				}
-				fsIno := archivefs.GetIno(info.Sys())
-
-				if fsIno == 0 {
-					// No valid inode info; skip deduplication.
-					ino.Ino = nid
-					ino.Size = uint32(size)
-					shouldAllocate = true
-				} else if entry, ok := w.linkMap[fsIno]; ok {
-					if entry.Count == 0 {
-						ino.Ino = nid
-						entry.Count = 1
-						entry.Inode = uint64(ino.Ino)
-						entry.RawBlockAddr = uint32(dataSize / BlockSize)
-						shouldAllocate = true
-					} else {
-						// If this is a hard link, we reuse the inode number and block address from the first
-						// file with the same fsInode.
-						ino.Ino = uint32(entry.Inode)
-						entry.Count += 1
-					}
-					ino.Size = uint32(size)
-					// Count only the links that are in the source tree.
-					ino.Nlink = uint16(entry.Nlink)
-					ino.RawBlockAddr = entry.RawBlockAddr
-					rawBlockAssigned = true
-
-					w.linkMap[fsIno] = entry
-				} else {
-					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
-				}
+			ino.Ino = nid
+			ino.Size = uint32(size)
+			ino.Format = setBits(ino.Format, layout, InodeDataLayoutBit, InodeDataLayoutBits)
+			if group != nil {
+				ino.Nlink = uint16(group.nlink)
 			}
-			if inlined {
-				ino.Format = setBits(ino.Format, InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits)
-			} else {
-				ino.Format = setBits(ino.Format, InodeDataLayoutFlatPlain, InodeDataLayoutBit, InodeDataLayoutBits)
-				// Assign a block address when hardlink logic didn't set one (directories).
-				if !rawBlockAssigned {
-					ino.RawBlockAddr = uint32(dataSize / BlockSize)
-				}
+			if !inlined && !special {
+				ino.RawBlockAddr = uint32(dataSize / BlockSize)
 			}
 			w.inodes[path] = ino
 
 		case InodeExtended:
-			if ino.Mode&S_IFMT == S_IFDIR {
-				ino.Ino = nid
-				ino.Size = uint64(size)
-				shouldAllocate = true
-			} else if isSpecialFile(ino.Mode) {
-				// Device files, FIFOs, and sockets have no file data. RawBlockAddr
-				// was set by toInode to the encoded device number and must not be
-				// overwritten here or adjusted in the fixup pass.
-				ino.Ino = nid
-				ino.Size = 0
-				rawBlockAssigned = true
-			} else {
-				// Handle all non-directory files with hardlink deduplication
-				fsys, ok := w.src.(fs.ReadLinkFS)
-				if !ok {
-					return metaSize, dataSize, fmt.Errorf("source filesystem must implement readLinkFS")
-				}
-
-				info, err := fsys.Lstat(path)
-				if err != nil {
-					return metaSize, dataSize, fmt.Errorf("failed to stat file %q: %w", path, err)
-				}
-				fsIno := archivefs.GetIno(info.Sys())
-
-				if fsIno == 0 {
-					// No valid inode info; skip deduplication.
-					ino.Ino = nid
-					ino.Size = uint64(size)
-					shouldAllocate = true
-				} else if entry, ok := w.linkMap[fsIno]; ok {
-					if entry.Count == 0 {
-						ino.Ino = nid
-						entry.Count = 1
-						entry.Inode = uint64(ino.Ino)
-						entry.RawBlockAddr = uint32(dataSize / BlockSize)
-						shouldAllocate = true
-					} else {
-						// If this is a hard link, we reuse the inode number and block address from the first
-						// file with the same fsInode.
-						ino.Ino = uint32(entry.Inode)
-						entry.Count += 1
-					}
-					ino.Size = uint64(size)
-					// Count only the links that are in the source tree.
-					ino.Nlink = uint32(entry.Nlink)
-					ino.RawBlockAddr = entry.RawBlockAddr
-					rawBlockAssigned = true
-
-					w.linkMap[fsIno] = entry
-				} else {
-					return metaSize, dataSize, fmt.Errorf("inode count for %q not found", path)
-				}
+			ino.Ino = nid
+			ino.Size = uint64(size)
+			ino.Format = setBits(ino.Format, layout, InodeDataLayoutBit, InodeDataLayoutBits)
+			if group != nil {
+				ino.Nlink = uint32(group.nlink)
 			}
-			if inlined {
-				ino.Format = setBits(ino.Format, InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits)
-			} else {
-				ino.Format = setBits(ino.Format, InodeDataLayoutFlatPlain, InodeDataLayoutBit, InodeDataLayoutBits)
-				// Assign a block address when hardlink logic didn't set one (directories).
-				if !rawBlockAssigned {
-					ino.RawBlockAddr = uint32(dataSize / BlockSize)
-				}
+			if !inlined && !special {
+				ino.RawBlockAddr = uint32(dataSize / BlockSize)
 			}
 			w.inodes[path] = ino
 
@@ -351,18 +334,23 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 
 		if inlined {
 			metaSize += size
-		} else if shouldAllocate {
-			// Only allocate data space for the first occurrence of each
-			// hardlinked file, and every directory.
-			dataSize += size
-			dataSize = roundUp(dataSize, BlockSize)
+		} else if !special {
+			if useTailPacking {
+				// The full blocks go to the data area, and the tail goes after the inode.
+				dataSize += nblocks * BlockSize
+				metaSize += tailSize
+			} else {
+				dataSize += size
+				dataSize = roundUp(dataSize, BlockSize)
+			}
 		}
 		metaSize = roundUp(metaSize, InodeSlotSize)
 	}
 
 	metaSize = roundUp(metaSize, BlockSize)
 
-	dataBlockAddr := 1 + (metaSize / BlockSize)
+	// The data blocks start after the metadata blocks.
+	dataBlockAddr := metaSize / BlockSize
 
 	// fix up the raw block addresses now that we know the total size of the
 	// metadata space.
@@ -371,7 +359,7 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 
 		switch ino := ino.(type) {
 		case InodeCompact:
-			if !isInlined(ino) {
+			if hasDataBlocks(ino) {
 				// Special files (devices, FIFOs, sockets) store a device number in
 				// RawBlockAddr, not a data block address; do not offset it.
 				if !isSpecialFile(ino.Mode) {
@@ -380,7 +368,7 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				w.inodes[path] = ino
 			}
 		case InodeExtended:
-			if !isInlined(ino) {
+			if hasDataBlocks(ino) {
 				// Special files (devices, FIFOs, sockets) store a device number in
 				// RawBlockAddr, not a data block address; do not offset it.
 				if !isSpecialFile(ino.Mode) {
@@ -397,18 +385,21 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 }
 
 func (w *writer) writeMetadata(metaBlockAddr int64) error {
-	// Hard links share one inode: write it and its xattrs once, from the first link that firstPass gave a slot.
+	// Hard links share one inode, so write each inode and its inline data once.
 	writtenInodes := make(map[uint32]bool)
 
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
 		var nid uint32
+		var fileSize int64
 		switch ino := ino.(type) {
 		case InodeCompact:
 			nid = ino.Ino
+			fileSize = int64(ino.Size)
 		case InodeExtended:
 			nid = ino.Ino
+			fileSize = int64(ino.Size)
 		default:
 			return fmt.Errorf("unsupported inode type %T", ino)
 		}
@@ -422,11 +413,15 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 		off := metaBlockAddr*BlockSize + int64(nid)*InodeSlotSize
 
 		// Write the inode.
-		if err := binary.Write(io.NewOffsetWriter(w.dst, off), binary.LittleEndian, ino); err != nil {
+		inodeBytes, err := marshalInode(ino)
+		if err != nil {
+			return fmt.Errorf("failed to marshal inode for %q: %w", path, err)
+		}
+		if _, err := w.dst.WriteAt(inodeBytes, off); err != nil {
 			return fmt.Errorf("failed to write inode for %q: %w", path, err)
 		}
 
-		inodeEnd := off + int64(binary.Size(ino))
+		inodeEnd := off + int64(len(inodeBytes))
 		if xattrs := w.xattrs[path]; len(xattrs) > 0 {
 			if _, err := w.dst.WriteAt(xattrs, inodeEnd); err != nil {
 				return fmt.Errorf("failed to write xattrs for %q: %w", path, err)
@@ -434,17 +429,45 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 			inodeEnd += int64(len(xattrs))
 		}
 
-		// Small files are stored in the inline with the inode.
+		// An inline inode has all of its data after it, and a tail-packed inode has only its tail.
 		if isInlined(ino) {
 			data, _, err := w.dataForInode(path, ino)
 			if err != nil {
 				return fmt.Errorf("failed to get data for %q: %w", path, err)
 			}
 
-			// Write the inlined data.
-			_, err = io.Copy(io.NewOffsetWriter(w.dst, inodeEnd), data)
+			// Skip the full blocks, which go to the data area.
+			nblocks := fileSize / BlockSize
+			inlineSize := fileSize % BlockSize
+			if nblocks > 0 {
+				if _, err := io.CopyN(io.Discard, data, nblocks*BlockSize); err != nil {
+					_ = data.Close()
+					return fmt.Errorf("failed to skip full blocks for %q: %w", path, err)
+				}
+			}
+
+			if inlineSize == 0 {
+				_ = data.Close()
+				continue
+			}
+
+			// Like in the reader, the inline data follows the inode and its xattrs, and must end in the block where it starts.
+			inlineOff := inodeEnd
+			blockEnd := (inlineOff/BlockSize + 1) * BlockSize
+			if inlineOff+inlineSize > blockEnd {
+				_ = data.Close()
+				return fmt.Errorf("inline data would cross block boundary for %q: inode at %d, inline data %d-%d, block ends at %d",
+					path, off, inlineOff, inlineOff+inlineSize, blockEnd)
+			}
+
+			inlineBuf := make([]byte, inlineSize)
+			if _, err := io.ReadFull(data, inlineBuf); err != nil {
+				_ = data.Close()
+				return fmt.Errorf("failed to read inline data for %q: %w", path, err)
+			}
 			_ = data.Close()
-			if err != nil {
+
+			if _, err := w.dst.WriteAt(inlineBuf, inlineOff); err != nil {
 				return fmt.Errorf("failed to write inline data for %q: %w", path, err)
 			}
 		}
@@ -454,39 +477,39 @@ func (w *writer) writeMetadata(metaBlockAddr int64) error {
 }
 
 func (w *writer) writeData() error {
-	// Track which inodes have already had data written (for hardlink deduplication)
-	// Only track regular files, as directories are unique per inode.
+	// Hard links share one inode, so write the data of each inode only once.
 	writtenInodes := make(map[uint32]bool)
 
 	for _, path := range w.inodeOrder {
 		ino := w.inodes[path]
 
-		if isInlined(ino) {
-			// Small files are stored in the inline with the inode.
+		if !hasDataBlocks(ino) {
+			// Fully inlined files are stored alongside their inode.
 			continue
 		}
 
 		var rawBlockAddr uint32
-		var mode uint16
 		var nid uint32
+		var size int64
 		switch ino := ino.(type) {
 		case InodeCompact:
 			rawBlockAddr = ino.RawBlockAddr
-			mode = ino.Mode
 			nid = ino.Ino
+			size = int64(ino.Size)
 		case InodeExtended:
 			rawBlockAddr = ino.RawBlockAddr
-			mode = ino.Mode
 			nid = ino.Ino
+			size = int64(ino.Size)
 		default:
 			return fmt.Errorf("unsupported inode type %T", ino)
 		}
 
-		// Skip if we've already written data for this inode (hardlink case)
-		if mode&S_IFMT == S_IFREG && writtenInodes[nid] {
+		if writtenInodes[nid] {
 			continue
 		}
+		writtenInodes[nid] = true
 
+		// The file can change after the first pass, so copy only the size in the inode.
 		data, _, err := w.dataForInode(path, ino)
 		if err != nil {
 			return fmt.Errorf("failed to get data for %q: %w", path, err)
@@ -495,15 +518,21 @@ func (w *writer) writeData() error {
 			continue
 		}
 
-		_, err = io.Copy(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data)
+		if isInlined(ino) {
+			// Only the full blocks go to the data area, because the tail is after the inode.
+			nblocks := size / BlockSize
+			if nblocks > 0 {
+				_, err = io.CopyN(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data, nblocks*BlockSize)
+			}
+		} else {
+			_, err = io.CopyN(io.NewOffsetWriter(w.dst, int64(rawBlockAddr)*BlockSize), data, size)
+		}
 		_ = data.Close()
+		if errors.Is(err, io.EOF) {
+			err = fmt.Errorf("the file became shorter after the first pass: %w", err)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to write data for %q: %w", path, err)
-		}
-
-		// Mark this inode's data as written (only for regular files)
-		if mode&S_IFMT == S_IFREG {
-			writtenInodes[nid] = true
 		}
 	}
 
@@ -514,6 +543,8 @@ func (w *writer) populateInodes() error {
 	w.inodes = map[string]any{}
 	w.fileSizes = map[string]int64{}
 	w.xattrs = map[string][]byte{}
+	w.links = map[string]*linkGroup{}
+	groups := map[linkKey]*linkGroup{}
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -532,14 +563,23 @@ func (w *writer) populateInodes() error {
 				return fmt.Errorf("failed to read directory entries: %w", err)
 			}
 
-			nlink = len(entries) + 2
+			// A directory has links from its parent, from "." and from each subdirectory.
+			nlink = 2
+			for _, e := range entries {
+				if e.IsDir() {
+					nlink++
+				}
+			}
 		} else {
-			nlink = int(archivefs.GetNlink(fi.Sys()))
-			ino := archivefs.GetIno(fi.Sys())
-			if ino != 0 {
-				entry := w.linkMap[ino]
-				entry.Nlink++
-				w.linkMap[ino] = entry
+			// Like in the Linux initramfs unpacker, only files with more than one link are in a group.
+			if n, ino := archivefs.GetNlink(fi.Sys()), archivefs.GetIno(fi.Sys()); n > 1 && ino != 0 {
+				nlink = int(n)
+				key := linkKey{archivefs.GetDev(fi.Sys()), ino, statModeFromFileMode(fi.Mode()) & S_IFMT}
+				if groups[key] == nil {
+					groups[key] = &linkGroup{}
+				}
+				groups[key].nlink++
+				w.links[path] = groups[key]
 			}
 		}
 
@@ -750,6 +790,7 @@ func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFIn
 
 	compact := fi.Size() <= math.MaxUint32 &&
 		uid <= math.MaxUint16 && gid <= math.MaxUint16 &&
+		nlink <= math.MaxUint16 &&
 		fi.ModTime().IsZero()
 
 	if compact {
@@ -865,17 +906,95 @@ func offsetToNID(metaOffset int64) (uint32, error) {
 }
 
 func isInlined(ino any) bool {
-	var format uint16
+	return dataLayout(ino) == InodeDataLayoutFlatInline
+}
+
+func dataLayout(ino any) uint16 {
 	switch ino := ino.(type) {
 	case InodeCompact:
-		format = ino.Format
+		return bitRange(ino.Format, InodeDataLayoutBit, InodeDataLayoutBits)
 	case InodeExtended:
-		format = ino.Format
+		return bitRange(ino.Format, InodeDataLayoutBit, InodeDataLayoutBits)
+	}
+	return InodeDataLayoutFlatPlain
+}
+
+// inlinePolicy decides the data layout of an inode. Like with mkfs.erofs -E noinline_data, regular file data is never inline.
+func inlinePolicy(mode uint16, size, inodeSize int64) (inlined, tailPacked bool) {
+	if size == 0 {
+		return false, false
+	}
+
+	nblocks := size / BlockSize
+	tailSize := size % BlockSize
+
+	switch mode & S_IFMT {
+	case S_IFDIR, S_IFLNK:
+		// The tail shares a block with the inode, so it must leave room for the inode.
+		if tailSize == 0 || tailSize > BlockSize-inodeSize {
+			return false, false
+		}
+		if nblocks == 0 {
+			return true, false
+		}
+		return false, true
+	}
+
+	return false, false
+}
+
+// hasDataBlocks reports whether the inode has blocks in the data area: a plain inode, or a tail-packed inode.
+func hasDataBlocks(ino any) bool {
+	var size uint64
+	switch v := ino.(type) {
+	case InodeCompact:
+		size = uint64(v.Size)
+	case InodeExtended:
+		size = v.Size
 	default:
 		return false
 	}
+	layout := dataLayout(ino)
+	return layout == InodeDataLayoutFlatPlain || layout == InodeDataLayoutFlatInline && size >= BlockSize
+}
 
-	return bitRange(format, InodeDataLayoutBit, InodeDataLayoutBits) == InodeDataLayoutFlatInline
+func marshalInode(ino any) ([]byte, error) {
+	var buf bytes.Buffer
+	switch v := ino.(type) {
+	case InodeCompact:
+		if err := binary.Write(&buf, binary.LittleEndian, v); err != nil {
+			return nil, err
+		}
+	case InodeExtended:
+		if err := binary.Write(&buf, binary.LittleEndian, v); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported inode type %T", ino)
+	}
+	return buf.Bytes(), nil
+}
+
+// checksumSuperBlock calculates the checksum from the superblock to the end of block 0.
+func (w *writer) checksumSuperBlock(sb *SuperBlock) error {
+	sbCopy := *sb
+	sbCopy.Checksum = 0
+
+	var marshalled bytes.Buffer
+	if err := binary.Write(&marshalled, binary.LittleEndian, sbCopy); err != nil {
+		return err
+	}
+
+	table := crc32.MakeTable(crc32.Castagnoli)
+	checksum := crc32.Checksum(marshalled.Bytes(), table)
+
+	// The checksum also covers the rest of block 0 after the superblock.
+	tailStart := SuperBlockOffset + int64(marshalled.Len())
+	checksum = ^crc32.Update(checksum, table, w.dst.block0[tailStart:])
+
+	sb.Checksum = checksum
+
+	return nil
 }
 
 // isSpecialFile reports whether the inode mode represents a device file,

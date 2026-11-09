@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/unikraft/go-archivefs/erofs"
+	"github.com/unikraft/go-archivefs/internal/testutil"
 	"github.com/unikraft/go-archivefs/tarfs"
 )
 
@@ -23,12 +24,19 @@ func createImage(t *testing.T, src fs.FS, opts ...erofs.ErofsCreateOption) *erof
 	require.NoError(t, err)
 	t.Cleanup(func() { imgFile.Close() })
 
-	require.NoError(t, erofs.Create(imgFile, src, opts...))
+	writeImage(t, imgFile, src, opts...)
 
 	fsys, err := erofs.Open(imgFile)
 	require.NoError(t, err)
 
 	return fsys
+}
+
+// writeImage writes an EROFS image of src to f, and checks it with fsck.erofs.
+func writeImage(t *testing.T, f *os.File, src fs.FS, opts ...erofs.ErofsCreateOption) {
+	t.Helper()
+	require.NoError(t, erofs.Create(f, src, opts...))
+	testutil.CheckEROFS(t, f.Name())
 }
 
 // createTarFS is a test helper that builds a tarfs from a slice of tar entries.

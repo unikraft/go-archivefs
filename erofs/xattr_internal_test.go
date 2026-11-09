@@ -75,7 +75,7 @@ func TestReadSharedXattrs(t *testing.T) {
 	require.Equal(t, map[string]string{"user.a": "x", "trusted.s": "y"}, got)
 }
 
-func TestXattrsInlineDataBoundary(t *testing.T) {
+func TestInlineDataBoundary(t *testing.T) {
 	f, err := os.Create(filepath.Join(t.TempDir(), "img"))
 	require.NoError(t, err)
 	defer f.Close()
@@ -86,9 +86,8 @@ func TestXattrsInlineDataBoundary(t *testing.T) {
 	require.NoError(t, err)
 	metaOff := image.sb.NidToOffset(0)
 
-	// place writes a symlink inode with xattrs and an inline target in a new block, and returns its nid.
-	xattrs := concat(ibodyHeader(0), xattrEntry(XattrIndexUser, "a", "x"))
-	place := func(target string) uint64 {
+	// place writes a symlink inode with xattrs and an inline target at off in a new block, and returns its nid.
+	place := func(target string, xattrs []byte, off int64) uint64 {
 		ino := InodeExtended{
 			Format: setBits(setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
 				InodeDataLayoutFlatInline, InodeDataLayoutBit, InodeDataLayoutBits),
@@ -101,27 +100,47 @@ func TestXattrsInlineDataBoundary(t *testing.T) {
 		require.NoError(t, binary.Write(&b, binary.LittleEndian, &ino))
 		b.Write(xattrs)
 		b.WriteString(target)
-		pos := int64(len(img))
-		img = append(img, make([]byte, roundUp(int64(b.Len()), BlockSize))...)
+		pos := int64(len(img)) + off
+		img = append(img, make([]byte, roundUp(off+int64(b.Len()), BlockSize))...)
 		copy(img[pos:], b.Bytes())
 		return uint64(pos-metaOff) / InodeSlotSize
 	}
-	// The target follows the inode and its xattrs, and ends at the end of the block or after it.
+	xattrs := concat(ibodyHeader(0), xattrEntry(XattrIndexUser, "a", "x"))
 	tailSize := BlockSize - binary.Size(InodeExtended{}) - len(xattrs)
-	fits := place(strings.Repeat("c", tailSize))
-	crosses := place(strings.Repeat("d", tailSize+1))
+	cases := []struct {
+		name    string
+		target  string
+		xattrs  []byte
+		off     int64
+		crosses bool
+	}{
+		{"inode ends in the next block", strings.Repeat("a", BlockSize-32), nil, BlockSize - InodeSlotSize, false},
+		{"inode in the middle of a block", strings.Repeat("b", BlockSize/2), nil, BlockSize / 2, true},
+		{"after the xattrs, to the end of the block", strings.Repeat("c", tailSize), xattrs, 0, false},
+		{"after the xattrs, after the end of the block", strings.Repeat("d", tailSize+1), xattrs, 0, true},
+		{"empty", "", nil, 0, false},
+	}
+	nids := make([]uint64, len(cases))
+	for i, tc := range cases {
+		nids[i] = place(tc.target, tc.xattrs, tc.off)
+	}
 
 	image, err = OpenImage(bytes.NewReader(img))
 	require.NoError(t, err)
-	ino, err := image.Inode(fits)
-	require.NoError(t, err)
-	target, err := ino.Readlink()
-	require.NoError(t, err)
-	require.Equal(t, strings.Repeat("c", tailSize), target)
-	got, err := ino.GetXattrs()
-	require.NoError(t, err)
-	require.Equal(t, map[string]string{"user.a": "x"}, got)
-
-	_, err = image.Inode(crosses)
-	require.ErrorContains(t, err, "cross block boundary")
+	for i, tc := range cases {
+		ino, err := image.Inode(nids[i])
+		if tc.crosses {
+			require.ErrorContains(t, err, "cross block boundary", tc.name)
+			continue
+		}
+		require.NoError(t, err, tc.name)
+		target, err := ino.Readlink()
+		require.NoError(t, err, tc.name)
+		require.Equal(t, tc.target, target, tc.name)
+		got, err := ino.GetXattrs()
+		require.NoError(t, err, tc.name)
+		if tc.xattrs != nil {
+			require.Equal(t, map[string]string{"user.a": "x"}, got, tc.name)
+		}
+	}
 }
