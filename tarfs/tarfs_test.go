@@ -43,6 +43,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -51,6 +52,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -970,4 +972,126 @@ func TestTarFSCreateXattrs(t *testing.T) {
 	got, err := fi.Sys().(*tarfs.FileHeader).GetXattrs()
 	require.NoError(t, err)
 	require.Equal(t, xattrs, got)
+}
+
+// testSys is the FileInfo.Sys() value of a file in a test file system.
+type testSys struct {
+	uid, gid     int
+	major, minor uint32
+	ino, nlink   uint64
+	xattrs       map[string]string
+}
+
+func (s *testSys) GetUID() int                           { return s.uid }
+func (s *testSys) GetGID() int                           { return s.gid }
+func (s *testSys) GetDevMajor() uint32                   { return s.major }
+func (s *testSys) GetDevMinor() uint32                   { return s.minor }
+func (s *testSys) GetIno() uint64                        { return s.ino }
+func (s *testSys) GetNlink() uint64                      { return s.nlink }
+func (s *testSys) GetXattrs() (map[string]string, error) { return s.xattrs, nil }
+
+// tarEntry is the part of a tar header that the tests of Create check.
+type tarEntry struct {
+	Name, Linkname     string
+	Typeflag           byte
+	Mode, Size         int64
+	Uid, Gid           int
+	Devmajor, Devminor int64
+	ModTime            int64
+	Xattr              string // the value of user.a
+}
+
+// readTar returns the entries of the tar archive in data.
+func readTar(t *testing.T, data []byte) []tarEntry {
+	t.Helper()
+
+	var entries []tarEntry
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return entries
+		}
+		require.NoError(t, err)
+		entries = append(entries, tarEntry{
+			hdr.Name, hdr.Linkname, hdr.Typeflag, hdr.Mode, hdr.Size, hdr.Uid, hdr.Gid,
+			hdr.Devmajor, hdr.Devminor, hdr.ModTime.Unix(), hdr.PAXRecords["SCHILY.xattr.user.a"],
+		})
+	}
+}
+
+func TestTarFSCreateMetadata(t *testing.T) {
+	passwd := &testSys{uid: 1000, gid: 1001, ino: 10, nlink: 2, xattrs: map[string]string{"user.a": "x"}}
+	src := fstest.MapFS{
+		"dev/null":    {Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, Sys: &testSys{major: 1, minor: 3}},
+		"etc/passwd":  {Mode: 0o644, Data: []byte("root"), Sys: passwd},
+		"etc/passwd-": {Mode: 0o644, Data: []byte("root"), Sys: passwd},
+		"run/sock":    {Mode: fs.ModeSocket | 0o755},
+	}
+	var dst bytes.Buffer
+	require.NoError(t, tarfs.Create(&dst, src))
+
+	require.Equal(t, []tarEntry{
+		{Name: "dev", Typeflag: tar.TypeDir, Mode: 0o555},
+		{Name: "dev/null", Typeflag: tar.TypeChar, Mode: 0o666, Devmajor: 1, Devminor: 3},
+		{Name: "etc", Typeflag: tar.TypeDir, Mode: 0o555},
+		{Name: "etc/passwd", Typeflag: tar.TypeReg, Mode: 0o644, Size: 4, Uid: 1000, Gid: 1001, Xattr: "x"},
+		{Name: "etc/passwd-", Linkname: "etc/passwd", Typeflag: tar.TypeLink, Mode: 0o644, Uid: 1000, Gid: 1001, Xattr: "x"},
+		{Name: "run", Typeflag: tar.TypeDir, Mode: 0o555},
+	}, readTar(t, dst.Bytes()))
+
+	dstFS, err := tarfs.Open(bytes.NewReader(dst.Bytes()))
+	require.NoError(t, err)
+	data, err := fs.ReadFile(dstFS, "etc/passwd-")
+	require.NoError(t, err)
+	require.Equal(t, "root", string(data))
+}
+
+func TestTarFSCreateRoot(t *testing.T) {
+	mtime := time.Unix(1700000000, 0)
+	src := fstest.MapFS{
+		".": {Mode: fs.ModeDir | 0o750, ModTime: mtime, Sys: &testSys{uid: 7, gid: 8, xattrs: map[string]string{"user.a": "x"}}},
+		"f": {Mode: 0o644},
+	}
+	file := tarEntry{Name: "f", Typeflag: tar.TypeReg, Mode: 0o644}
+
+	var dst bytes.Buffer
+	require.NoError(t, tarfs.Create(&dst, src))
+	require.Equal(t, []tarEntry{file}, readTar(t, dst.Bytes()))
+
+	dst.Reset()
+	require.NoError(t, tarfs.Create(&dst, src, tarfs.WithRootDir(true)))
+	require.Equal(t, []tarEntry{
+		{Name: "./", Typeflag: tar.TypeDir, Mode: 0o750, Uid: 7, Gid: 8, ModTime: mtime.Unix(), Xattr: "x"},
+		file,
+	}, readTar(t, dst.Bytes()))
+}
+
+func TestTarFSCreateHardLinkMismatch(t *testing.T) {
+	sys := &testSys{ino: 10, nlink: 2}
+	for name, files := range map[string][2]*fstest.MapFile{
+		"mode":   {{Mode: 0o644, Data: []byte("x"), Sys: sys}, {Mode: 0o600, Data: []byte("x"), Sys: sys}},
+		"size":   {{Mode: 0o644, Data: []byte("x"), Sys: sys}, {Mode: 0o644, Data: []byte("xy"), Sys: sys}},
+		"target": {{Mode: fs.ModeSymlink | 0o777, Data: []byte("x"), Sys: sys}, {Mode: fs.ModeSymlink | 0o777, Data: []byte("y"), Sys: sys}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := tarfs.Create(io.Discard, fstest.MapFS{"a": files[0], "b": files[1]})
+			var pathErr *fs.PathError
+			require.ErrorAs(t, err, &pathErr)
+			require.Equal(t, "b", pathErr.Path)
+			require.ErrorContains(t, err, "inode of a")
+		})
+	}
+}
+
+var errWrite = errors.New("write failed")
+
+// failWriter fails all writes.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errWrite }
+
+func TestTarFSCreateCloseError(t *testing.T) {
+	// Without the root, Close writes the only data of an empty tree: the end of the archive.
+	require.ErrorIs(t, tarfs.Create(failWriter{}, fstest.MapFS{}), errWrite)
 }
