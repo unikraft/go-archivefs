@@ -396,11 +396,34 @@ func TestWriterHardLinkNlinkOverflow(t *testing.T) {
 		testFS[fmt.Sprintf("l%05d", i)] = &fstest.MapFile{Data: []byte("x"), Mode: 0o644, Sys: inodeSys{7, 2}}
 	}
 
-	_, fsys := newImage(t, testFS)
+	buildTime := time.Unix(1700000000, 0)
+	_, fsys := newImage(t, testFS, WithBuildTime(buildTime))
 
 	for _, name := range []string{"l00000", fmt.Sprintf("l%05d", n-1)} {
 		fi, err := fsys.Stat(name)
 		require.NoError(t, err)
 		require.Equal(t, uint32(n), fi.Sys().(*Inode).Nlink(), name)
+		require.Equal(t, buildTime.Unix(), fi.ModTime().Unix(), name)
+	}
+}
+
+type ownerSys struct{ uid int }
+
+func (s ownerSys) GetUID() int { return s.uid }
+func (s ownerSys) GetGID() int { return 0 }
+
+func TestWriterExtendedInodeWithoutMtime(t *testing.T) {
+	buildTime := time.Unix(1700000000, 0)
+	testFS := fstest.MapFS{
+		"compact":  {Data: []byte("c"), Mode: 0o644},
+		"extended": {Data: []byte("e"), Mode: 0o644, Sys: ownerSys{math.MaxUint16 + 1}},
+	}
+
+	_, fsys := newImage(t, testFS, WithBuildTime(buildTime))
+
+	for _, name := range []string{"compact", "extended"} {
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, buildTime.Unix(), fi.ModTime().Unix(), name)
 	}
 }

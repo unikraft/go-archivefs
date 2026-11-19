@@ -60,6 +60,7 @@ type writer struct {
 	fileSizes  map[string]int64
 	xattrs     map[string][]byte     // inline xattr area by path
 	links      map[string]*linkGroup // hard link group of each path with more than one link
+	buildTime  time.Time
 	opts       ErofsCreateOptions
 }
 
@@ -70,6 +71,11 @@ type linkGroup struct {
 }
 
 func (w *writer) write() error {
+	w.buildTime = time.Now()
+	if w.opts.buildTime != nil {
+		w.buildTime = *w.opts.buildTime
+	}
+
 	if err := w.populateInodes(); err != nil {
 		return fmt.Errorf("failed to populate inodes: %w", err)
 	}
@@ -116,11 +122,6 @@ func (w *writer) write() error {
 		copy(sbUUID[:], uuidBytes)
 	}
 
-	buildTime := time.Now()
-	if w.opts.buildTime != nil {
-		buildTime = *w.opts.buildTime
-	}
-
 	// Hard links share one inode, so count the inodes and not the paths.
 	uniqueInodes := make(map[uint32]bool)
 	for _, path := range w.inodeOrder {
@@ -140,8 +141,8 @@ func (w *writer) write() error {
 		Blocks:        uint32((metaSize + dataSize) / BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
 		UUID:          sbUUID,
-		BuildTime:     uint64(buildTime.Unix()),
-		BuildTimeNsec: uint32(buildTime.Nanosecond()),
+		BuildTime:     uint64(w.buildTime.Unix()),
+		BuildTimeNsec: uint32(w.buildTime.Nanosecond()),
 		FeatureCompat: EROFS_FEATURE_COMPAT_SB_CHKSUM | EROFS_FEATURE_COMPAT_MTIME,
 		// TODO: other fields (volume name, etc.)
 	}
@@ -235,6 +236,8 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 				Mode:         c.Mode,
 				UID:          uint32(c.UID),
 				GID:          uint32(c.GID),
+				Mtime:        uint64(w.buildTime.Unix()),
+				MtimeNsec:    uint32(w.buildTime.Nanosecond()),
 				RawBlockAddr: c.RawBlockAddr,
 			}
 		}
@@ -620,7 +623,7 @@ func (w *writer) populateInodes() error {
 			w.xattrs[path] = ibody
 		}
 
-		w.inodes[path] = toInode(fi, nlink, xattrCount(ibody), w.opts.allRoot, originalFInfo)
+		w.inodes[path] = toInode(fi, nlink, xattrCount(ibody), w.opts.allRoot, originalFInfo, w.buildTime)
 		w.inodeOrder = append(w.inodeOrder, path)
 		w.fileSizes[path] = fi.Size()
 
@@ -776,7 +779,7 @@ func (w *writer) findInodeAtPath(path string) (uint64, error) {
 	return uint64(nid), nil
 }
 
-func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo) any {
+func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo, buildTime time.Time) any {
 	var uid, gid int
 	mode := fi.Mode()
 
@@ -822,6 +825,12 @@ func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFIn
 		}
 	}
 
+	// A compact inode without an mtime shows the build time, so an extended one does too.
+	mtime := fi.ModTime()
+	if mtime.IsZero() {
+		mtime = buildTime
+	}
+
 	return InodeExtended{
 		Format:       setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
 		XattrCount:   icount,
@@ -829,8 +838,8 @@ func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFIn
 		Nlink:        uint32(nlink),
 		UID:          uint32(uid),
 		GID:          uint32(gid),
-		Mtime:        uint64(fi.ModTime().Unix()),
-		MtimeNsec:    uint32(fi.ModTime().Nanosecond()),
+		Mtime:        uint64(mtime.Unix()),
+		MtimeNsec:    uint32(mtime.Nanosecond()),
 		RawBlockAddr: rdev,
 	}
 }
