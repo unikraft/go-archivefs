@@ -14,7 +14,6 @@ package tarfs_test
 import (
 	"archive/tar"
 	"bytes"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,11 +27,6 @@ func TestTarFSCreateDirFS(t *testing.T) {
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "d"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "d", "f"), []byte("data"), 0o644))
 	require.NoError(t, os.Link(filepath.Join(dir, "d", "f"), filepath.Join(dir, "g")))
-	sock, err := net.Listen("unix", filepath.Join(dir, "sock"))
-	if err != nil {
-		t.Skipf("cannot make a unix socket: %v", err)
-	}
-	t.Cleanup(func() { require.NoError(t, sock.Close()) })
 
 	var dst bytes.Buffer
 	require.NoError(t, tarfs.Create(&dst, os.DirFS(dir)))
