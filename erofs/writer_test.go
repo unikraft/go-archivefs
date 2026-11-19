@@ -427,3 +427,41 @@ func TestWriterExtendedInodeWithoutMtime(t *testing.T) {
 		require.Equal(t, buildTime.Unix(), fi.ModTime().Unix(), name)
 	}
 }
+
+type dirTypedEntry struct{ fs.DirEntry }
+
+func (dirTypedEntry) IsDir() bool       { return true }
+func (dirTypedEntry) Type() fs.FileMode { return fs.ModeDir }
+
+// typeChangingFS lists its files as directories after the walk.
+type typeChangingFS struct {
+	fstest.MapFS
+	calls *int
+}
+
+func (f typeChangingFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err := f.MapFS.ReadDir(name)
+	if err != nil || name != "." {
+		return entries, err
+	}
+	if *f.calls++; *f.calls > 2 {
+		for i, e := range entries {
+			entries[i] = dirTypedEntry{e}
+		}
+	}
+	return entries, nil
+}
+
+func TestWriterDirentTypeFromInode(t *testing.T) {
+	src := typeChangingFS{fstest.MapFS{"f": {Data: []byte("f"), Mode: 0o644}}, new(int)}
+
+	_, fsys := newImage(t, src)
+
+	entries, err := fsys.ReadDir(".")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, fs.FileMode(0), entries[0].Type())
+	got, err := fs.ReadFile(fsys, "f")
+	require.NoError(t, err)
+	require.Equal(t, "f", string(got))
+}

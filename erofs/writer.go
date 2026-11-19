@@ -669,7 +669,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		}
 
 		// Add information about the directory itself.
-		rootNid, err := w.findInodeAtPath(path)
+		rootNid, _, err := w.findInodeAtPath(path)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 		}
@@ -683,7 +683,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		// Add information about the parent directory.
 		if path != "." {
-			parentNid, err := w.findInodeAtPath(stdpath.Join(path, ".."))
+			parentNid, _, err := w.findInodeAtPath(stdpath.Join(path, ".."))
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 			}
@@ -705,14 +705,15 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 			if de.Name() == "." || strings.Contains(de.Name(), "\x00") || !fs.ValidPath(childPath) || stdpath.Base(childPath) != de.Name() {
 				return nil, 0, &fs.PathError{Op: "create", Path: childPath, Err: fs.ErrInvalid}
 			}
-			nid, err := w.findInodeAtPath(childPath)
+			// The type comes from the inode, as ReadDir can give another type than the walk did.
+			nid, mode, err := w.findInodeAtPath(childPath)
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", childPath, err)
 			}
 
 			dirents = append(dirents, Dirent{
 				Nid:      nid,
-				FileType: uint8(fileTypeFromFileMode(de.Type())),
+				FileType: fileTypeFromStatMode(mode),
 			})
 			names = append(names, de.Name())
 		}
@@ -758,25 +759,22 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 	}
 }
 
-func (w *writer) findInodeAtPath(path string) (uint64, error) {
+func (w *writer) findInodeAtPath(path string) (nid uint64, mode uint16, err error) {
 	cleanPath := stdpath.Clean(path)
 
 	ino, ok := w.inodes[cleanPath]
 	if !ok {
-		return 0, fmt.Errorf("failed to find inode for path %q", path)
+		return 0, 0, fmt.Errorf("failed to find inode for path %q", path)
 	}
 
-	var nid uint32
 	switch ino := ino.(type) {
 	case InodeCompact:
-		nid = ino.Ino
+		return uint64(ino.Ino), ino.Mode, nil
 	case InodeExtended:
-		nid = ino.Ino
+		return uint64(ino.Ino), ino.Mode, nil
 	default:
-		return 0, fmt.Errorf("unsupported inode type %T", ino)
+		return 0, 0, fmt.Errorf("unsupported inode type %T", ino)
 	}
-
-	return uint64(nid), nil
 }
 
 func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo, buildTime time.Time) any {
