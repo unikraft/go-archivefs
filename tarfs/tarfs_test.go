@@ -1164,3 +1164,33 @@ func TestTarFSCreateRootRoundTrip(t *testing.T) {
 
 	require.Equal(t, readTar(t, first.Bytes()), readTar(t, second.Bytes()))
 }
+
+func TestTarFSOpenModeTypeBits(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "d/", Typeflag: tar.TypeDir, Mode: 0o60755}))
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "d/f", Typeflag: tar.TypeReg, Mode: 0o20644, Size: 2}))
+	_, err := tw.Write([]byte("hi"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	fsys, err := tarfs.Open(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	fi, err := fsys.Stat("d")
+	require.NoError(t, err)
+	require.Equal(t, fs.ModeDir|0o755, fi.Mode())
+	fi, err = fsys.Stat("d/f")
+	require.NoError(t, err)
+	require.Equal(t, fs.FileMode(0o644), fi.Mode())
+	data, err := fs.ReadFile(fsys, "d/f")
+	require.NoError(t, err)
+	require.Equal(t, "hi", string(data))
+
+	var dst bytes.Buffer
+	require.NoError(t, tarfs.Create(&dst, fsys))
+	require.Equal(t, []tarEntry{
+		{Name: "d", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "d/f", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
+	}, readTar(t, dst.Bytes()))
+}

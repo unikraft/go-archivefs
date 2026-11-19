@@ -68,6 +68,9 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			continue // Skip unknown entry types.
 		}
 
+		// Typeflag gives the type, but FileInfo also takes the type bits of Mode.
+		h.Mode &= 0o7777
+
 		name := h.Name
 		h.Name = sanitizePath(h.Name)
 		if h.Name == "" {
@@ -175,8 +178,6 @@ func Open(ra io.ReaderAt) (*FS, error) {
 	}
 	if rootHdr != nil {
 		root.Header = *rootHdr
-		// Typeflag gives the type, but FileInfo also takes the type bits of Mode.
-		root.Mode &= 0o7777
 	}
 	root.Header.Name = "."
 
