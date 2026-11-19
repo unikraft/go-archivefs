@@ -974,7 +974,6 @@ func TestTarFSCreateXattrs(t *testing.T) {
 	require.Equal(t, xattrs, got)
 }
 
-// testSys is the FileInfo.Sys() value of a file in a test file system.
 type testSys struct {
 	uid, gid     int
 	major, minor uint32
@@ -990,7 +989,6 @@ func (s *testSys) GetIno() uint64                        { return s.ino }
 func (s *testSys) GetNlink() uint64                      { return s.nlink }
 func (s *testSys) GetXattrs() (map[string]string, error) { return s.xattrs, nil }
 
-// tarEntry is the part of a tar header that the tests of Create check.
 type tarEntry struct {
 	Name, Linkname     string
 	Typeflag           byte
@@ -1001,7 +999,6 @@ type tarEntry struct {
 	Xattr              string // the value of user.a
 }
 
-// readTar returns the entries of the tar archive in data.
 func readTar(t *testing.T, data []byte) []tarEntry {
 	t.Helper()
 
@@ -1086,7 +1083,6 @@ func TestTarFSCreateHardLinkMismatch(t *testing.T) {
 
 var errWrite = errors.New("write failed")
 
-// failWriter fails all writes.
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, errWrite }

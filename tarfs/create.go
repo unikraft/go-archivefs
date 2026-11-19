@@ -34,7 +34,6 @@ func WithRootDir(root bool) CreateOption {
 	}
 }
 
-// linkKey identifies the inode of a hard link by device, inode number and type.
 type linkKey struct {
 	dev, ino uint64
 	typ      fs.FileMode
@@ -103,7 +102,6 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 		}
 		archivefs.SetTarXattrs(hdr, xattrs)
 
-		// The first path of an inode with more than one link holds the file. The other paths are links to it.
 		if ino := archivefs.GetIno(sys); !d.IsDir() && ino != 0 && archivefs.GetNlink(sys) > 1 {
 			key := linkKey{archivefs.GetDev(sys), ino, fi.Mode().Type()}
 			if first, ok := links[key]; ok {
