@@ -550,6 +550,10 @@ func (w *writer) populateInodes() error {
 		if err != nil {
 			return err
 		}
+		// A source can list a path twice, such as "." as a child of the root.
+		if _, ok := w.inodes[path]; ok {
+			return &fs.PathError{Op: "create", Path: path, Err: fs.ErrInvalid}
+		}
 
 		fi, err := d.Info()
 		if err != nil {
@@ -690,6 +694,9 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		for _, de := range entries {
 			childPath := stdpath.Join(path, de.Name())
+			if de.Name() == "." || strings.Contains(de.Name(), "\x00") || !fs.ValidPath(childPath) || stdpath.Base(childPath) != de.Name() {
+				return nil, 0, &fs.PathError{Op: "create", Path: childPath, Err: fs.ErrInvalid}
+			}
 			nid, err := w.findInodeAtPath(childPath)
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", childPath, err)
@@ -708,6 +715,11 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		// broke lookup for filenames starting with characters before '.'
 		// in ASCII (e.g. '#' = 0x23 < '.' = 0x2E).
 		sortDirents(dirents, names)
+		for i := 1; i < len(names); i++ {
+			if names[i] == names[i-1] {
+				return nil, 0, &fs.PathError{Op: "create", Path: stdpath.Join(path, names[i]), Err: fs.ErrInvalid}
+			}
+		}
 
 		buf, err := encodeDirents(dirents, names)
 		if err != nil {

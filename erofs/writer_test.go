@@ -335,3 +335,44 @@ func TestWriterReusedDestination(t *testing.T) {
 	}
 	require.Zero(t, stale, "bytes that differ from an image in an empty destination")
 }
+
+func TestWriterInvalidName(t *testing.T) {
+	src := fstest.MapFS{"f": {Mode: fs.ModeNamedPipe | 0o644}, "d": {Mode: fs.ModeDir | 0o755}}
+	for _, tt := range []struct{ file, name string }{
+		{"f", "../evil"}, {"f", "a/../../evil"}, {"f", "d/evil"}, {"f", ".."}, {"f", "."}, {"f", ""}, {"d", "."}, {"f", "f"},
+	} {
+		t.Run(tt.file+"-as-"+tt.name, func(t *testing.T) {
+			err := Create(newBytesWriterAt(0), testutil.RenamedFS{MapFS: src, File: tt.file, Name: tt.name})
+			require.ErrorIs(t, err, fs.ErrInvalid)
+		})
+	}
+}
+
+func TestWriterNULName(t *testing.T) {
+	src := fstest.MapFS{"a": {Data: []byte("AAAA"), Mode: 0o644}, "a\x00b": {Data: []byte("BBBB"), Mode: 0o644}}
+	err := Create(newBytesWriterAt(0), src)
+	require.ErrorIs(t, err, fs.ErrInvalid)
+}
+
+// laterDupFS lists "f" twice in the root, from the ReadDir call after the walk on.
+type laterDupFS struct {
+	fstest.MapFS
+	calls *int
+}
+
+func (f laterDupFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err := f.MapFS.ReadDir(name)
+	if err != nil || name != "." {
+		return entries, err
+	}
+	if *f.calls++; *f.calls > 2 {
+		entries = append(entries, entries[0])
+	}
+	return entries, nil
+}
+
+func TestWriterNameRepeatedAfterWalk(t *testing.T) {
+	src := laterDupFS{fstest.MapFS{"f": {Data: []byte("f"), Mode: 0o644}}, new(int)}
+	err := Create(newBytesWriterAt(0), src)
+	require.ErrorIs(t, err, fs.ErrInvalid)
+}
