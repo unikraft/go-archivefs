@@ -248,3 +248,18 @@ func TestCreateErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateHardLinkFileInfoMismatch(t *testing.T) {
+	src := fstest.MapFS{
+		"etc/shadow":  {Mode: 0o644, Data: []byte("s"), Sys: &cpio.Header{Inode: 7, Links: 2}},
+		"etc/shadow-": {Mode: 0o644, Data: []byte("s"), Sys: &cpio.Header{Inode: 7, Links: 2}},
+	}
+	fileInfo := cpio.WithFileInfoMap(map[string]cpio.FileInfo{
+		"/etc/shadow": {Mode: 0o600},
+	})
+
+	var buf bytes.Buffer
+	if err := cpio.Create(&buf, src, fileInfo); err == nil {
+		t.Fatal("Create error = nil, want an error for links with different modes")
+	}
+}

@@ -63,13 +63,6 @@ type writer struct {
 	opts       ErofsCreateOptions
 }
 
-// linkKey identifies a hard link group by device, inode number and type, like the Linux initramfs unpacker.
-type linkKey struct {
-	dev uint64
-	ino uint64
-	typ uint16
-}
-
 // linkGroup is a hard link group, whose paths share one inode.
 type linkGroup struct {
 	nlink int    // the number of links in the source tree
@@ -555,7 +548,7 @@ func (w *writer) populateInodes() error {
 	w.fileSizes = map[string]int64{}
 	w.xattrs = map[string][]byte{}
 	w.links = map[string]*linkGroup{}
-	groups := map[linkKey]*linkGroup{}
+	var links archivefs.HardLinks
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -586,15 +579,16 @@ func (w *writer) populateInodes() error {
 				}
 			}
 		} else {
-			// Like in the Linux initramfs unpacker, only files with more than one link are in a group.
-			if n, ino := archivefs.GetNlink(fi.Sys()), archivefs.GetIno(fi.Sys()); n > 1 && ino != 0 {
-				nlink = int(n)
-				key := linkKey{archivefs.GetDev(fi.Sys()), ino, statModeFromFileMode(fi.Mode()) & S_IFMT}
-				if groups[key] == nil {
-					groups[key] = &linkGroup{}
-				}
-				groups[key].nlink++
-				w.links[path] = groups[key]
+			first, err := links.Add(w.src, path, fi)
+			if err != nil {
+				return fmt.Errorf("failed to add hard link %q: %w", path, err)
+			}
+			switch {
+			case first == path:
+				w.links[path] = &linkGroup{nlink: 1}
+			case first != "":
+				w.links[first].nlink++
+				w.links[path] = w.links[first]
 			}
 		}
 

@@ -218,6 +218,16 @@ func TestWriterSpecialFileHardLinks(t *testing.T) {
 	require.Equal(t, nids[0], nids[1])
 }
 
+func TestWriterHardLinkMismatch(t *testing.T) {
+	testFS := fstest.MapFS{
+		"a": &fstest.MapFile{Data: []byte("aaaa"), Mode: 0o644, Sys: inodeSys{7, 2}},
+		"b": &fstest.MapFile{Data: []byte("bbbbbbbb"), Mode: 0o644, Sys: inodeSys{7, 2}},
+	}
+
+	err := Create(newBytesWriterAt(0), testFS)
+	require.ErrorContains(t, err, "inode of a")
+}
+
 func TestWriterInodeNumberCollision(t *testing.T) {
 	// Files on different devices can have the same inode number, but only files of one type are links.
 	data := bytes.Repeat([]byte("c"), 3*BlockSize)
