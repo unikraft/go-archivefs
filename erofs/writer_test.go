@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -375,4 +376,21 @@ func TestWriterNameRepeatedAfterWalk(t *testing.T) {
 	src := laterDupFS{fstest.MapFS{"f": {Data: []byte("f"), Mode: 0o644}}, new(int)}
 	err := Create(newBytesWriterAt(0), src)
 	require.ErrorIs(t, err, fs.ErrInvalid)
+}
+
+func TestWriterHardLinkNlinkOverflow(t *testing.T) {
+	// The source says 2 links, but the tree has more than a compact inode can count.
+	const n = math.MaxUint16 + 2
+	testFS := fstest.MapFS{}
+	for i := range n {
+		testFS[fmt.Sprintf("l%05d", i)] = &fstest.MapFile{Data: []byte("x"), Mode: 0o644, Sys: inodeSys{7, 2}}
+	}
+
+	_, fsys := newImage(t, testFS)
+
+	for _, name := range []string{"l00000", fmt.Sprintf("l%05d", n-1)} {
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, uint32(n), fi.Sys().(*Inode).Nlink(), name)
+	}
 }

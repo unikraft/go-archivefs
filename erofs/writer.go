@@ -234,6 +234,17 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 		}
 
 		ino := w.inodes[path]
+		// toInode picked the layout before the links in the tree were counted, and a compact inode holds only 65535.
+		if c, ok := ino.(InodeCompact); ok && group != nil && group.nlink > math.MaxUint16 {
+			ino = InodeExtended{
+				Format:       setBits(c.Format, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
+				XattrCount:   c.XattrCount,
+				Mode:         c.Mode,
+				UID:          uint32(c.UID),
+				GID:          uint32(c.GID),
+				RawBlockAddr: c.RawBlockAddr,
+			}
+		}
 
 		// For regular files, use the cached size from populateInodes to avoid
 		// opening the file twice (once here for size, once in the write phase
