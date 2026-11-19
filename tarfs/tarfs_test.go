@@ -1194,3 +1194,59 @@ func TestTarFSOpenModeTypeBits(t *testing.T) {
 		{Name: "d/f", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
 	}, readTar(t, dst.Bytes()))
 }
+
+func writeLinks(t *testing.T, links ...[2]string) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "z", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2}))
+	_, err := tw.Write([]byte("hi"))
+	require.NoError(t, err)
+	for _, l := range links {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: l[0], Linkname: l[1], Typeflag: tar.TypeLink, Mode: 0o644}))
+	}
+	require.NoError(t, tw.Close())
+	return buf.Bytes()
+}
+
+func TestTarFSOpenHardLinkChain(t *testing.T) {
+	fsys, err := tarfs.Open(bytes.NewReader(writeLinks(t, [2]string{"y", "z"}, [2]string{"x", "y"})))
+	require.NoError(t, err)
+
+	var inos []uint64
+	for _, name := range []string{"x", "y", "z"} {
+		data, err := fs.ReadFile(fsys, name)
+		require.NoError(t, err)
+		require.Equal(t, "hi", string(data), name)
+
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), archivefs.GetNlink(fi.Sys()), name)
+		inos = append(inos, archivefs.GetIno(fi.Sys()))
+	}
+	require.Equal(t, []uint64{inos[0], inos[0], inos[0]}, inos)
+}
+
+func TestTarFSOpenHardLinkToItself(t *testing.T) {
+	fsys, err := tarfs.Open(bytes.NewReader(writeLinks(t, [2]string{"y", "z"}, [2]string{"z", "z"})))
+	require.NoError(t, err)
+
+	for _, name := range []string{"y", "z"} {
+		data, err := fs.ReadFile(fsys, name)
+		require.NoError(t, err)
+		require.Equal(t, "hi", string(data), name)
+	}
+}
+
+func TestTarFSOpenHardLinkCycle(t *testing.T) {
+	for name, links := range map[string][][2]string{
+		"self":  {{"a", "a"}},
+		"cycle": {{"a", "b"}, {"b", "a"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := tarfs.Open(bytes.NewReader(writeLinks(t, links...)))
+			require.ErrorContains(t, err, "cycle of hard links")
+		})
+	}
+}
