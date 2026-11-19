@@ -56,6 +56,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/unikraft/go-archivefs"
 	"github.com/unikraft/go-archivefs/internal/testutil"
 	"github.com/unikraft/go-archivefs/tarfs"
 )
@@ -1090,4 +1091,76 @@ func (failWriter) Write([]byte) (int, error) { return 0, errWrite }
 func TestTarFSCreateCloseError(t *testing.T) {
 	// Without the root, Close writes the only data of an empty tree: the end of the archive.
 	require.ErrorIs(t, tarfs.Create(failWriter{}, fstest.MapFS{}), errWrite)
+}
+
+func TestTarFSOpenRoot(t *testing.T) {
+	mtime := time.Unix(1700000000, 0)
+	root := tar.Header{
+		Typeflag:   tar.TypeDir,
+		Mode:       0o750,
+		Uid:        7,
+		ModTime:    mtime,
+		PAXRecords: map[string]string{"SCHILY.xattr.user.a": "x"},
+	}
+	for _, tt := range []struct {
+		test    string
+		name    string
+		hdr     tar.Header
+		wantMod fs.FileMode
+		wantUID int
+	}{
+		{test: "dot-slash", name: "./", wantMod: 0o750, wantUID: 7},
+		{test: "slash", name: "/", wantMod: 0o750, wantUID: 7},
+		{test: "dot", name: ".", wantMod: 0o750, wantUID: 7},
+		{test: "parent", name: "../", wantMod: 0o755},
+		{test: "dot-dot-in-path", name: "a/..", wantMod: 0o755},
+		{test: "empty", name: "", wantMod: 0o755},
+		{test: "type-bits", name: "./", hdr: tar.Header{Typeflag: tar.TypeDir, Mode: 0o60750, Uid: 7}, wantMod: 0o750, wantUID: 7},
+		{test: "symlink", name: "./", hdr: tar.Header{Typeflag: tar.TypeSymlink, Linkname: "/etc", Mode: 0o700, Uid: 7}, wantMod: 0o755},
+	} {
+		t.Run(tt.test, func(t *testing.T) {
+			hdr := root
+			if tt.hdr.Typeflag != 0 {
+				hdr = tt.hdr
+			}
+			hdr.Name = tt.name
+
+			var buf bytes.Buffer
+			tw := tar.NewWriter(&buf)
+			require.NoError(t, tw.WriteHeader(&hdr))
+			require.NoError(t, tw.WriteHeader(&tar.Header{Name: "f", Typeflag: tar.TypeReg, Mode: 0o644}))
+			require.NoError(t, tw.Close())
+
+			fsys, err := tarfs.Open(bytes.NewReader(buf.Bytes()))
+			require.NoError(t, err)
+
+			fi, err := fsys.Stat(".")
+			require.NoError(t, err)
+			require.Equal(t, fs.ModeDir, fi.Mode().Type())
+			require.Equal(t, ".", fi.Name())
+			require.Equal(t, tt.wantMod, fi.Mode().Perm())
+			require.Equal(t, tt.wantUID, archivefs.GetUID(fi.Sys()))
+
+			entries, err := fsys.ReadDir(".")
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			require.Equal(t, "f", entries[0].Name())
+		})
+	}
+}
+
+func TestTarFSCreateRootRoundTrip(t *testing.T) {
+	src := fstest.MapFS{
+		".": {Mode: fs.ModeDir | 0o750, ModTime: time.Unix(1700000000, 0), Sys: &testSys{uid: 7, gid: 8, xattrs: map[string]string{"user.a": "x"}}},
+		"f": {Mode: 0o644},
+	}
+	var first bytes.Buffer
+	require.NoError(t, tarfs.Create(&first, src, tarfs.WithRootDir(true)))
+
+	fsys, err := tarfs.Open(bytes.NewReader(first.Bytes()))
+	require.NoError(t, err)
+	var second bytes.Buffer
+	require.NoError(t, tarfs.Create(&second, fsys, tarfs.WithRootDir(true)))
+
+	require.Equal(t, readTar(t, first.Bytes()), readTar(t, second.Bytes()))
 }

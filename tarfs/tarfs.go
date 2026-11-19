@@ -39,6 +39,7 @@ func Open(ra io.ReaderAt) (*FS, error) {
 	tr := tar.NewReader(r)
 
 	dirents := map[string]*dirent{}
+	var rootHdr *tar.Header
 	for {
 		// round to next 512 byte boundary.
 		begin := (r.offset + 511) &^ 511
@@ -67,10 +68,13 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			continue // Skip unknown entry types.
 		}
 
+		name := h.Name
 		h.Name = sanitizePath(h.Name)
-
-		// there might be a junk root entry.
 		if h.Name == "" {
+			// sanitizePath also clears names outside of the root, such as "../".
+			if h.Typeflag == tar.TypeDir && (name == "." || name == "./" || name == "/") {
+				rootHdr = h
+			}
 			continue
 		}
 
@@ -166,10 +170,15 @@ func Open(ra io.ReaderAt) (*FS, error) {
 	root := dirent{
 		Header: tar.Header{
 			Typeflag: tar.TypeDir,
-			Name:     ".",
 			Mode:     0o755,
 		},
 	}
+	if rootHdr != nil {
+		root.Header = *rootHdr
+		// Typeflag gives the type, but FileInfo also takes the type bits of Mode.
+		root.Mode &= 0o7777
+	}
+	root.Header.Name = "."
 
 	for _, p := range paths {
 		d := dirents[p]
@@ -242,15 +251,7 @@ func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
 	}
 
 	if sanitizePath(name) == "" {
-		d := &dirent{
-			Header: tar.Header{
-				Typeflag: tar.TypeDir,
-				Name:     ".",
-				Mode:     0o755,
-			},
-		}
-
-		return d.Info()
+		return fsys.root.Info()
 	}
 
 	d, err := resolve(&fsys.root, name)
