@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/unikraft/go-archivefs/cpio"
+	"github.com/unikraft/go-archivefs/internal/testutil"
 )
 
 // tree returns a source file system with all the file types and link layouts.
@@ -261,5 +262,17 @@ func TestCreateHardLinkFileInfoMismatch(t *testing.T) {
 	var buf bytes.Buffer
 	if err := cpio.Create(&buf, src, fileInfo); err == nil {
 		t.Fatal("Create error = nil, want an error for links with different modes")
+	}
+}
+
+func TestCreateRootListedAgain(t *testing.T) {
+	src := fstest.MapFS{"f": {Mode: 0o644}, "d": {Mode: fs.ModeDir | 0o755}}
+	for _, file := range []string{"f", "d"} {
+		for _, name := range []string{".", ""} {
+			err := cpio.Create(io.Discard, testutil.RenamedFS{MapFS: src, File: file, Name: name})
+			if !errors.Is(err, fs.ErrInvalid) {
+				t.Errorf("%s as %q: Create error = %v, want %v", file, name, err, fs.ErrInvalid)
+			}
+		}
 	}
 }
