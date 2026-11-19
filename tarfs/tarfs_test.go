@@ -1264,3 +1264,13 @@ func TestTarFSCreateInvalidName(t *testing.T) {
 		})
 	}
 }
+
+func TestTarFSCreateHardLinkListedTwice(t *testing.T) {
+	src := testutil.RenamedFS{
+		MapFS: fstest.MapFS{"f": {Mode: 0o644, Data: []byte("x"), Sys: &testSys{ino: 7, nlink: 2}}},
+		File:  "f",
+		Name:  "f",
+	}
+	err := tarfs.Create(io.Discard, src)
+	require.ErrorContains(t, err, "listed twice")
+}

@@ -113,6 +113,9 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 		if ino := archivefs.GetIno(sys); !d.IsDir() && ino != 0 && archivefs.GetNlink(sys) > 1 {
 			key := linkKey{archivefs.GetDev(sys), ino, fi.Mode().Type()}
 			if first, ok := links[key]; ok {
+				if first.Name == name {
+					return &fs.PathError{Op: "create", Path: name, Err: errors.New("listed twice")}
+				}
 				// A source that merges file systems can give one inode number to different files.
 				if hdr.Mode != first.Mode || hdr.Size != first.Size || hdr.Linkname != first.Linkname {
 					return &fs.PathError{Op: "create", Path: name, Err: fmt.Errorf("inode of %s, but a different mode, size or target", first.Name)}
