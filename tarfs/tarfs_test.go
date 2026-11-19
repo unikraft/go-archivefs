@@ -1250,3 +1250,17 @@ func TestTarFSOpenHardLinkCycle(t *testing.T) {
 		})
 	}
 }
+
+func TestTarFSCreateInvalidName(t *testing.T) {
+	src := fstest.MapFS{"f": {Mode: fs.ModeNamedPipe | 0o644}, "d": {Mode: fs.ModeDir | 0o755}}
+	for _, tt := range []struct{ file, name string }{
+		{"f", "../evil"}, {"f", "a/../../evil"}, {"f", "d/evil"}, {"f", ".."}, {"f", "."}, {"f", ""}, {"d", "."},
+	} {
+		t.Run(tt.file+"-as-"+tt.name, func(t *testing.T) {
+			for _, opts := range [][]tarfs.CreateOption{nil, {tarfs.WithRootDir(true)}} {
+				err := tarfs.Create(io.Discard, testutil.RenamedFS{MapFS: src, File: tt.file, Name: tt.name}, opts...)
+				require.ErrorIs(t, err, fs.ErrInvalid)
+			}
+		})
+	}
+}

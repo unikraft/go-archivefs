@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"path"
 
 	"github.com/unikraft/go-archivefs"
 )
@@ -50,13 +51,20 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 	tw := tar.NewWriter(dst)
 	links := map[linkKey]*tar.Header{}
 
-	err := fs.WalkDir(src, ".", func(path string, d fs.DirEntry, err error) error {
+	var seenRoot bool
+	err := fs.WalkDir(src, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
+		// A child named "." or "" is also at ".", but comes after the root.
+		if name == "." && seenRoot || name != "." && (!fs.ValidPath(name) || path.Base(name) != d.Name()) {
+			return &fs.PathError{Op: "create", Path: name, Err: fs.ErrInvalid}
+		}
+		seenRoot = true
+
 		// A tar archive has an implicit root directory, and a root entry can confuse unarchivers.
-		if path == "." && !o.root {
+		if name == "." && !o.root {
 			return nil
 		}
 
@@ -75,7 +83,7 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 				return errors.New("source FS does not support symlinks")
 			}
 
-			link, err = linkFS.ReadLink(path)
+			link, err = linkFS.ReadLink(name)
 			if err != nil {
 				return err
 			}
@@ -85,8 +93,8 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 		if err != nil {
 			return err
 		}
-		hdr.Name = path
-		if path == "." {
+		hdr.Name = name
+		if name == "." {
 			hdr.Name = "./"
 		}
 
@@ -107,7 +115,7 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 			if first, ok := links[key]; ok {
 				// A source that merges file systems can give one inode number to different files.
 				if hdr.Mode != first.Mode || hdr.Size != first.Size || hdr.Linkname != first.Linkname {
-					return &fs.PathError{Op: "create", Path: path, Err: fmt.Errorf("inode of %s, but a different mode, size or target", first.Name)}
+					return &fs.PathError{Op: "create", Path: name, Err: fmt.Errorf("inode of %s, but a different mode, size or target", first.Name)}
 				}
 				hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, first.Name, 0
 				return tw.WriteHeader(hdr)
@@ -123,7 +131,7 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 			return nil
 		}
 
-		f, err := src.Open(path)
+		f, err := src.Open(name)
 		if err != nil {
 			return err
 		}
