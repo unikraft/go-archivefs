@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"slices"
@@ -22,6 +23,8 @@ import (
 
 	"github.com/unikraft/go-archivefs"
 )
+
+var errLinkCycle = errors.New("cycle of hard links")
 
 var (
 	_ fs.FS         = (*FS)(nil)
@@ -39,6 +42,7 @@ func Open(ra io.ReaderAt) (*FS, error) {
 	tr := tar.NewReader(r)
 
 	dirents := map[string]*dirent{}
+	var rootHdr *tar.Header
 	for {
 		// round to next 512 byte boundary.
 		begin := (r.offset + 511) &^ 511
@@ -67,10 +71,16 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			continue // Skip unknown entry types.
 		}
 
-		h.Name = sanitizePath(h.Name)
+		// Typeflag gives the type, but FileInfo also takes the type bits of Mode.
+		h.Mode &= 0o7777
 
-		// there might be a junk root entry.
+		name := h.Name
+		h.Name = sanitizePath(h.Name)
 		if h.Name == "" {
+			// sanitizePath also clears names outside of the root, such as "../".
+			if h.Typeflag == tar.TypeDir && (name == "." || name == "./" || name == "/") {
+				rootHdr = h
+			}
 			continue
 		}
 
@@ -95,6 +105,11 @@ func Open(ra io.ReaderAt) (*FS, error) {
 			}
 		}
 
+		// GNU tar writes a hard link to its own path for a path that it archives twice.
+		if _, ok := dirents[h.Name]; ok && h.Typeflag == tar.TypeLink && sanitizePath(h.Linkname) == h.Name {
+			continue
+		}
+
 		size := r.offset - begin
 
 		dirents[h.Name] = &dirent{
@@ -105,71 +120,66 @@ func Open(ra io.ReaderAt) (*FS, error) {
 		}
 	}
 
-	// Assign synthetic inode numbers. Hardlinks share the same inode.
+	paths := slices.Sorted(maps.Keys(dirents))
+
+	// Point each hard link at the file at the end of its chain of links.
 	var nextIno uint64
-	// targetToIno maps hardlink target paths to their assigned inode.
-	targetToIno := map[string]uint64{}
-	// targetNlink counts the number of links for each hardlink target.
-	targetNlink := map[string]int{}
-
-	// First pass: count hardlinks and assign inodes to targets.
-	for _, d := range dirents {
-		if d.Typeflag == tar.TypeLink {
-			target := sanitizePath(d.Linkname)
-			targetNlink[target]++
+	for _, p := range paths {
+		d := dirents[p]
+		if d.Typeflag != tar.TypeLink {
+			continue
 		}
-	}
 
-	// Point hardlinks to the underlying dirent.
-	for path, d := range dirents {
-		if d.Typeflag == tar.TypeLink {
-			name := sanitizePath(d.Linkname)
-			target, ok := dirents[name]
-			if !ok {
+		var chain []string
+		seen := map[string]bool{}
+		for name := p; d.Typeflag == tar.TypeLink; {
+			if seen[name] {
+				return nil, fmt.Errorf("failed to resolve hardlink %q: %w", p, errLinkCycle)
+			}
+			seen[name] = true
+			chain = append(chain, name)
+
+			var ok bool
+			name = sanitizePath(d.Linkname)
+			if d, ok = dirents[name]; !ok {
 				return nil, fmt.Errorf("failed to resolve hardlink %q: %w", name, fs.ErrNotExist)
 			}
-
-			// Assign an inode to the target if not yet assigned.
-			ino, ok := targetToIno[name]
-			if !ok {
-				nextIno++
-				ino = nextIno
-				targetToIno[name] = ino
-				target.ino = ino
-				target.nlink = uint64(targetNlink[name] + 1) // +1 for the target itself
-			}
-
-			targetCopy := *target
-			targetCopy.Header.Name = path
-			targetCopy.ino = ino
-			targetCopy.nlink = target.nlink
-			dirents[path] = &targetCopy
 		}
-	}
 
-	// Second pass: assign unique inodes to all remaining entries.
-	for _, d := range dirents {
 		if d.ino == 0 {
 			nextIno++
 			d.ino = nextIno
-			d.nlink = 1
+		}
+		for _, name := range chain {
+			link := *d
+			link.Header.Name = name
+			dirents[name] = &link
 		}
 	}
 
-	var paths []string
-	for path := range dirents {
-		paths = append(paths, path)
+	nlinks := map[uint64]uint64{}
+	for _, p := range paths {
+		d := dirents[p]
+		if d.ino == 0 {
+			nextIno++
+			d.ino = nextIno
+		}
+		nlinks[d.ino]++
 	}
-
-	slices.Sort(paths)
+	for _, d := range dirents {
+		d.nlink = nlinks[d.ino]
+	}
 
 	root := dirent{
 		Header: tar.Header{
 			Typeflag: tar.TypeDir,
-			Name:     ".",
 			Mode:     0o755,
 		},
 	}
+	if rootHdr != nil {
+		root.Header = *rootHdr
+	}
+	root.Header.Name = "."
 
 	for _, p := range paths {
 		d := dirents[p]
@@ -242,15 +252,7 @@ func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
 	}
 
 	if sanitizePath(name) == "" {
-		d := &dirent{
-			Header: tar.Header{
-				Typeflag: tar.TypeDir,
-				Name:     ".",
-				Mode:     0o755,
-			},
-		}
-
-		return d.Info()
+		return fsys.root.Info()
 	}
 
 	d, err := resolve(&fsys.root, name)

@@ -12,31 +12,68 @@ package tarfs
 import (
 	"archive/tar"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"path"
 
 	"github.com/unikraft/go-archivefs"
 )
 
-// Create creates a tar archive from the given filesystem.
-func Create(dst io.Writer, src fs.FS) error {
-	tw := tar.NewWriter(dst)
-	defer tw.Close()
+// CreateOption is an option for Create.
+type CreateOption func(*createOptions)
 
-	return fs.WalkDir(src, ".", func(path string, d fs.DirEntry, err error) error {
+type createOptions struct {
+	root bool
+}
+
+// WithRootDir writes the root directory as the entry "./", with its owner,
+// mode, modification time and extended attributes.
+func WithRootDir(root bool) CreateOption {
+	return func(o *createOptions) {
+		o.root = root
+	}
+}
+
+type linkKey struct {
+	dev, ino uint64
+	typ      fs.FileMode
+}
+
+// Create writes src to dst as a tar archive with owners, devices, xattrs and
+// hard links, without the root and sockets.
+func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
+	var o createOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	tw := tar.NewWriter(dst)
+	links := map[linkKey]*tar.Header{}
+
+	var seenRoot bool
+	err := fs.WalkDir(src, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// There's an implicit root directory in a tar archive, so we don't need to
-		// write it (and it can confuse unarchivers).
-		if path == "." {
+		// A child named "." or "" is also at ".", but comes after the root.
+		if name == "." && seenRoot || name != "." && (!fs.ValidPath(name) || path.Base(name) != d.Name()) {
+			return &fs.PathError{Op: "create", Path: name, Err: fs.ErrInvalid}
+		}
+		seenRoot = true
+
+		// A tar archive has an implicit root directory, and a root entry can confuse unarchivers.
+		if name == "." && !o.root {
 			return nil
 		}
 
 		fi, err := d.Info()
 		if err != nil {
 			return err
+		}
+		if fi.Mode()&fs.ModeSocket != 0 {
+			return nil
 		}
 
 		var link string
@@ -46,7 +83,7 @@ func Create(dst io.Writer, src fs.FS) error {
 				return errors.New("source FS does not support symlinks")
 			}
 
-			link, err = linkFS.ReadLink(path)
+			link, err = linkFS.ReadLink(name)
 			if err != nil {
 				return err
 			}
@@ -56,12 +93,38 @@ func Create(dst io.Writer, src fs.FS) error {
 		if err != nil {
 			return err
 		}
-		hdr.Name = path
-		xattrs, err := archivefs.GetXattrs(fi.Sys())
+		hdr.Name = name
+		if name == "." {
+			hdr.Name = "./"
+		}
+
+		sys := fi.Sys()
+		hdr.Uid, hdr.Gid = archivefs.GetUID(sys), archivefs.GetGID(sys)
+		// FileInfoHeader sets the device numbers of a *syscall.Stat_t on more systems than archivefs.
+		if (hdr.Typeflag == tar.TypeChar || hdr.Typeflag == tar.TypeBlock) && hdr.Devmajor == 0 && hdr.Devminor == 0 {
+			hdr.Devmajor, hdr.Devminor = int64(archivefs.GetDevMajor(sys)), int64(archivefs.GetDevMinor(sys))
+		}
+		xattrs, err := archivefs.GetXattrs(sys)
 		if err != nil {
 			return err
 		}
 		archivefs.SetTarXattrs(hdr, xattrs)
+
+		if ino := archivefs.GetIno(sys); !d.IsDir() && ino != 0 && archivefs.GetNlink(sys) > 1 {
+			key := linkKey{archivefs.GetDev(sys), ino, fi.Mode().Type()}
+			if first, ok := links[key]; ok {
+				if first.Name == name {
+					return &fs.PathError{Op: "create", Path: name, Err: errors.New("listed twice")}
+				}
+				// A source that merges file systems can give one inode number to different files.
+				if hdr.Mode != first.Mode || hdr.Size != first.Size || hdr.Linkname != first.Linkname {
+					return &fs.PathError{Op: "create", Path: name, Err: fmt.Errorf("inode of %s, but a different mode, size or target", first.Name)}
+				}
+				hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, first.Name, 0
+				return tw.WriteHeader(hdr)
+			}
+			links[key] = hdr
+		}
 
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
@@ -71,7 +134,7 @@ func Create(dst io.Writer, src fs.FS) error {
 			return nil
 		}
 
-		f, err := src.Open(path)
+		f, err := src.Open(name)
 		if err != nil {
 			return err
 		}
@@ -84,4 +147,9 @@ func Create(dst io.Writer, src fs.FS) error {
 
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	return tw.Close()
 }
