@@ -12,10 +12,8 @@ package tarfs
 import (
 	"archive/tar"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
-	"path"
 
 	"github.com/unikraft/go-archivefs"
 )
@@ -35,11 +33,6 @@ func WithRootDir(root bool) CreateOption {
 	}
 }
 
-type linkKey struct {
-	dev, ino uint64
-	typ      fs.FileMode
-}
-
 // Create writes src to dst as a tar archive with owners, devices, xattrs and
 // hard links, without the root and sockets.
 func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
@@ -49,19 +42,16 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 	}
 
 	tw := tar.NewWriter(dst)
-	links := map[linkKey]*tar.Header{}
+	var links archivefs.HardLinks
 
-	var seenRoot bool
+	var names archivefs.Names
 	err := fs.WalkDir(src, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-
-		// A child named "." or "" is also at ".", but comes after the root.
-		if name == "." && seenRoot || name != "." && (!fs.ValidPath(name) || path.Base(name) != d.Name()) {
-			return &fs.PathError{Op: "create", Path: name, Err: fs.ErrInvalid}
+		if err := names.Check(name, d); err != nil {
+			return &fs.PathError{Op: "create", Path: name, Err: err}
 		}
-		seenRoot = true
 
 		// A tar archive has an implicit root directory, and a root entry can confuse unarchivers.
 		if name == "." && !o.root {
@@ -110,20 +100,13 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 		}
 		archivefs.SetTarXattrs(hdr, xattrs)
 
-		if ino := archivefs.GetIno(sys); !d.IsDir() && ino != 0 && archivefs.GetNlink(sys) > 1 {
-			key := linkKey{archivefs.GetDev(sys), ino, fi.Mode().Type()}
-			if first, ok := links[key]; ok {
-				if first.Name == name {
-					return &fs.PathError{Op: "create", Path: name, Err: errors.New("listed twice")}
-				}
-				// A source that merges file systems can give one inode number to different files.
-				if hdr.Mode != first.Mode || hdr.Size != first.Size || hdr.Linkname != first.Linkname {
-					return &fs.PathError{Op: "create", Path: name, Err: fmt.Errorf("inode of %s, but a different mode, size or target", first.Name)}
-				}
-				hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, first.Name, 0
-				return tw.WriteHeader(hdr)
-			}
-			links[key] = hdr
+		first, err := links.Add(src, name, fi)
+		if err != nil {
+			return &fs.PathError{Op: "create", Path: name, Err: err}
+		}
+		if first != "" && first != name {
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, first, 0
+			return tw.WriteHeader(hdr)
 		}
 
 		if err := tw.WriteHeader(hdr); err != nil {

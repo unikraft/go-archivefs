@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,6 +218,16 @@ func TestWriterSpecialFileHardLinks(t *testing.T) {
 	require.Equal(t, nids[0], nids[1])
 }
 
+func TestWriterHardLinkMismatch(t *testing.T) {
+	testFS := fstest.MapFS{
+		"a": &fstest.MapFile{Data: []byte("aaaa"), Mode: 0o644, Sys: inodeSys{7, 2}},
+		"b": &fstest.MapFile{Data: []byte("bbbbbbbb"), Mode: 0o644, Sys: inodeSys{7, 2}},
+	}
+
+	err := Create(newBytesWriterAt(0), testFS)
+	require.ErrorContains(t, err, "inode of a")
+}
+
 func TestWriterInodeNumberCollision(t *testing.T) {
 	// Files on different devices can have the same inode number, but only files of one type are links.
 	data := bytes.Repeat([]byte("c"), 3*BlockSize)
@@ -334,4 +345,123 @@ func TestWriterReusedDestination(t *testing.T) {
 		}
 	}
 	require.Zero(t, stale, "bytes that differ from an image in an empty destination")
+}
+
+func TestWriterInvalidName(t *testing.T) {
+	src := fstest.MapFS{"f": {Mode: fs.ModeNamedPipe | 0o644}, "d": {Mode: fs.ModeDir | 0o755}}
+	for _, tt := range []struct{ file, name string }{
+		{"f", "../evil"}, {"f", "a/../../evil"}, {"f", "d/evil"}, {"f", "a\x00b"}, {"f", ".."}, {"f", "."}, {"f", ""}, {"d", "."}, {"f", "f"},
+	} {
+		t.Run(tt.file+"-as-"+tt.name, func(t *testing.T) {
+			err := Create(newBytesWriterAt(0), testutil.RenamedFS{MapFS: src, File: tt.file, Name: tt.name})
+			require.ErrorIs(t, err, fs.ErrInvalid)
+		})
+	}
+}
+
+func TestWriterNULName(t *testing.T) {
+	src := fstest.MapFS{"a": {Data: []byte("AAAA"), Mode: 0o644}, "a\x00b": {Data: []byte("BBBB"), Mode: 0o644}}
+	err := Create(newBytesWriterAt(0), src)
+	require.ErrorIs(t, err, fs.ErrInvalid)
+}
+
+// laterDupFS lists "f" twice in the root, from the ReadDir call after the walk on.
+type laterDupFS struct {
+	fstest.MapFS
+	calls *int
+}
+
+func (f laterDupFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err := f.MapFS.ReadDir(name)
+	if err != nil || name != "." {
+		return entries, err
+	}
+	if *f.calls++; *f.calls > 2 {
+		entries = append(entries, entries[0])
+	}
+	return entries, nil
+}
+
+func TestWriterNameRepeatedAfterWalk(t *testing.T) {
+	src := laterDupFS{fstest.MapFS{"f": {Data: []byte("f"), Mode: 0o644}}, new(int)}
+	err := Create(newBytesWriterAt(0), src)
+	require.ErrorIs(t, err, fs.ErrInvalid)
+}
+
+func TestWriterHardLinkNlinkOverflow(t *testing.T) {
+	// The source says 2 links, but the tree has more than a compact inode can count.
+	const n = math.MaxUint16 + 2
+	testFS := fstest.MapFS{}
+	for i := range n {
+		testFS[fmt.Sprintf("l%05d", i)] = &fstest.MapFile{Data: []byte("x"), Mode: 0o644, Sys: inodeSys{7, 2}}
+	}
+
+	buildTime := time.Unix(1700000000, 0)
+	_, fsys := newImage(t, testFS, WithBuildTime(buildTime))
+
+	for _, name := range []string{"l00000", fmt.Sprintf("l%05d", n-1)} {
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, uint32(n), fi.Sys().(*Inode).Nlink(), name)
+		require.Equal(t, buildTime.Unix(), fi.ModTime().Unix(), name)
+	}
+}
+
+type ownerSys struct{ uid int }
+
+func (s ownerSys) GetUID() int { return s.uid }
+func (s ownerSys) GetGID() int { return 0 }
+
+func TestWriterExtendedInodeWithoutMtime(t *testing.T) {
+	buildTime := time.Unix(1700000000, 0)
+	testFS := fstest.MapFS{
+		"compact":  {Data: []byte("c"), Mode: 0o644},
+		"extended": {Data: []byte("e"), Mode: 0o644, Sys: ownerSys{math.MaxUint16 + 1}},
+	}
+
+	_, fsys := newImage(t, testFS, WithBuildTime(buildTime))
+
+	for _, name := range []string{"compact", "extended"} {
+		fi, err := fsys.Stat(name)
+		require.NoError(t, err)
+		require.Equal(t, buildTime.Unix(), fi.ModTime().Unix(), name)
+	}
+}
+
+type dirTypedEntry struct{ fs.DirEntry }
+
+func (dirTypedEntry) IsDir() bool       { return true }
+func (dirTypedEntry) Type() fs.FileMode { return fs.ModeDir }
+
+// typeChangingFS lists its files as directories after the walk.
+type typeChangingFS struct {
+	fstest.MapFS
+	calls *int
+}
+
+func (f typeChangingFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err := f.MapFS.ReadDir(name)
+	if err != nil || name != "." {
+		return entries, err
+	}
+	if *f.calls++; *f.calls > 2 {
+		for i, e := range entries {
+			entries[i] = dirTypedEntry{e}
+		}
+	}
+	return entries, nil
+}
+
+func TestWriterDirentTypeFromInode(t *testing.T) {
+	src := typeChangingFS{fstest.MapFS{"f": {Data: []byte("f"), Mode: 0o644}}, new(int)}
+
+	_, fsys := newImage(t, src)
+
+	entries, err := fsys.ReadDir(".")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, fs.FileMode(0), entries[0].Type())
+	got, err := fs.ReadFile(fsys, "f")
+	require.NoError(t, err)
+	require.Equal(t, "f", string(got))
 }

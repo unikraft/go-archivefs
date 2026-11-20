@@ -60,14 +60,8 @@ type writer struct {
 	fileSizes  map[string]int64
 	xattrs     map[string][]byte     // inline xattr area by path
 	links      map[string]*linkGroup // hard link group of each path with more than one link
+	buildTime  time.Time
 	opts       ErofsCreateOptions
-}
-
-// linkKey identifies a hard link group by device, inode number and type, like the Linux initramfs unpacker.
-type linkKey struct {
-	dev uint64
-	ino uint64
-	typ uint16
 }
 
 // linkGroup is a hard link group, whose paths share one inode.
@@ -77,6 +71,11 @@ type linkGroup struct {
 }
 
 func (w *writer) write() error {
+	w.buildTime = time.Now()
+	if w.opts.buildTime != nil {
+		w.buildTime = *w.opts.buildTime
+	}
+
 	if err := w.populateInodes(); err != nil {
 		return fmt.Errorf("failed to populate inodes: %w", err)
 	}
@@ -123,11 +122,6 @@ func (w *writer) write() error {
 		copy(sbUUID[:], uuidBytes)
 	}
 
-	buildTime := time.Now()
-	if w.opts.buildTime != nil {
-		buildTime = *w.opts.buildTime
-	}
-
 	// Hard links share one inode, so count the inodes and not the paths.
 	uniqueInodes := make(map[uint32]bool)
 	for _, path := range w.inodeOrder {
@@ -147,8 +141,8 @@ func (w *writer) write() error {
 		Blocks:        uint32((metaSize + dataSize) / BlockSize),
 		MetaBlockAddr: uint32(metaBlockAddr),
 		UUID:          sbUUID,
-		BuildTime:     uint64(buildTime.Unix()),
-		BuildTimeNsec: uint32(buildTime.Nanosecond()),
+		BuildTime:     uint64(w.buildTime.Unix()),
+		BuildTimeNsec: uint32(w.buildTime.Nanosecond()),
 		FeatureCompat: EROFS_FEATURE_COMPAT_SB_CHKSUM | EROFS_FEATURE_COMPAT_MTIME,
 		// TODO: other fields (volume name, etc.)
 	}
@@ -234,6 +228,19 @@ func (w *writer) firstPass() (metaSize, dataSize int64, err error) {
 		}
 
 		ino := w.inodes[path]
+		// toInode picked the layout before the links in the tree were counted, and a compact inode holds only 65535.
+		if c, ok := ino.(InodeCompact); ok && group != nil && group.nlink > math.MaxUint16 {
+			ino = InodeExtended{
+				Format:       setBits(c.Format, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
+				XattrCount:   c.XattrCount,
+				Mode:         c.Mode,
+				UID:          uint32(c.UID),
+				GID:          uint32(c.GID),
+				Mtime:        uint64(w.buildTime.Unix()),
+				MtimeNsec:    uint32(w.buildTime.Nanosecond()),
+				RawBlockAddr: c.RawBlockAddr,
+			}
+		}
 
 		// For regular files, use the cached size from populateInodes to avoid
 		// opening the file twice (once here for size, once in the write phase
@@ -544,11 +551,15 @@ func (w *writer) populateInodes() error {
 	w.fileSizes = map[string]int64{}
 	w.xattrs = map[string][]byte{}
 	w.links = map[string]*linkGroup{}
-	groups := map[linkKey]*linkGroup{}
+	var links archivefs.HardLinks
+	var names archivefs.Names
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if err := names.Check(path, d); err != nil {
+			return &fs.PathError{Op: "create", Path: path, Err: err}
 		}
 
 		fi, err := d.Info()
@@ -571,15 +582,16 @@ func (w *writer) populateInodes() error {
 				}
 			}
 		} else {
-			// Like in the Linux initramfs unpacker, only files with more than one link are in a group.
-			if n, ino := archivefs.GetNlink(fi.Sys()), archivefs.GetIno(fi.Sys()); n > 1 && ino != 0 {
-				nlink = int(n)
-				key := linkKey{archivefs.GetDev(fi.Sys()), ino, statModeFromFileMode(fi.Mode()) & S_IFMT}
-				if groups[key] == nil {
-					groups[key] = &linkGroup{}
-				}
-				groups[key].nlink++
-				w.links[path] = groups[key]
+			first, err := links.Add(w.src, path, fi)
+			if err != nil {
+				return fmt.Errorf("failed to add hard link %q: %w", path, err)
+			}
+			switch {
+			case first == path:
+				w.links[path] = &linkGroup{nlink: 1}
+			case first != "":
+				w.links[first].nlink++
+				w.links[path] = w.links[first]
 			}
 		}
 
@@ -611,7 +623,7 @@ func (w *writer) populateInodes() error {
 			w.xattrs[path] = ibody
 		}
 
-		w.inodes[path] = toInode(fi, nlink, xattrCount(ibody), w.opts.allRoot, originalFInfo)
+		w.inodes[path] = toInode(fi, nlink, xattrCount(ibody), w.opts.allRoot, originalFInfo, w.buildTime)
 		w.inodeOrder = append(w.inodeOrder, path)
 		w.fileSizes[path] = fi.Size()
 
@@ -657,7 +669,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		}
 
 		// Add information about the directory itself.
-		rootNid, err := w.findInodeAtPath(path)
+		rootNid, _, err := w.findInodeAtPath(path)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 		}
@@ -671,7 +683,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		// Add information about the parent directory.
 		if path != "." {
-			parentNid, err := w.findInodeAtPath(stdpath.Join(path, ".."))
+			parentNid, _, err := w.findInodeAtPath(stdpath.Join(path, ".."))
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", path, err)
 			}
@@ -690,14 +702,18 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		for _, de := range entries {
 			childPath := stdpath.Join(path, de.Name())
-			nid, err := w.findInodeAtPath(childPath)
+			if !archivefs.ValidName(de.Name()) {
+				return nil, 0, &fs.PathError{Op: "create", Path: childPath, Err: fs.ErrInvalid}
+			}
+			// The type comes from the inode, as ReadDir can give another type than the walk did.
+			nid, mode, err := w.findInodeAtPath(childPath)
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find inode for path %q: %w", childPath, err)
 			}
 
 			dirents = append(dirents, Dirent{
 				Nid:      nid,
-				FileType: uint8(fileTypeFromFileMode(de.Type())),
+				FileType: fileTypeFromStatMode(mode),
 			})
 			names = append(names, de.Name())
 		}
@@ -708,6 +724,11 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 		// broke lookup for filenames starting with characters before '.'
 		// in ASCII (e.g. '#' = 0x23 < '.' = 0x2E).
 		sortDirents(dirents, names)
+		for i := 1; i < len(names); i++ {
+			if names[i] == names[i-1] {
+				return nil, 0, &fs.PathError{Op: "create", Path: stdpath.Join(path, names[i]), Err: fs.ErrInvalid}
+			}
+		}
 
 		buf, err := encodeDirents(dirents, names)
 		if err != nil {
@@ -738,28 +759,25 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 	}
 }
 
-func (w *writer) findInodeAtPath(path string) (uint64, error) {
+func (w *writer) findInodeAtPath(path string) (nid uint64, mode uint16, err error) {
 	cleanPath := stdpath.Clean(path)
 
 	ino, ok := w.inodes[cleanPath]
 	if !ok {
-		return 0, fmt.Errorf("failed to find inode for path %q", path)
+		return 0, 0, fmt.Errorf("failed to find inode for path %q", path)
 	}
 
-	var nid uint32
 	switch ino := ino.(type) {
 	case InodeCompact:
-		nid = ino.Ino
+		return uint64(ino.Ino), ino.Mode, nil
 	case InodeExtended:
-		nid = ino.Ino
+		return uint64(ino.Ino), ino.Mode, nil
 	default:
-		return 0, fmt.Errorf("unsupported inode type %T", ino)
+		return 0, 0, fmt.Errorf("unsupported inode type %T", ino)
 	}
-
-	return uint64(nid), nil
 }
 
-func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo) any {
+func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFInfo *FileInfo, buildTime time.Time) any {
 	var uid, gid int
 	mode := fi.Mode()
 
@@ -805,6 +823,12 @@ func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFIn
 		}
 	}
 
+	// A compact inode without an mtime shows the build time, so an extended one does too.
+	mtime := fi.ModTime()
+	if mtime.IsZero() {
+		mtime = buildTime
+	}
+
 	return InodeExtended{
 		Format:       setBits(0, InodeLayoutExtended, InodeLayoutBit, InodeLayoutBits),
 		XattrCount:   icount,
@@ -812,8 +836,8 @@ func toInode(fi fs.FileInfo, nlink int, icount uint16, allRoot bool, originalFIn
 		Nlink:        uint32(nlink),
 		UID:          uint32(uid),
 		GID:          uint32(gid),
-		Mtime:        uint64(fi.ModTime().Unix()),
-		MtimeNsec:    uint32(fi.ModTime().Nanosecond()),
+		Mtime:        uint64(mtime.Unix()),
+		MtimeNsec:    uint32(mtime.Nanosecond()),
 		RawBlockAddr: rdev,
 	}
 }

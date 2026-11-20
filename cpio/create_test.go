@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/unikraft/go-archivefs/cpio"
+	"github.com/unikraft/go-archivefs/internal/testutil"
 )
 
 // tree returns a source file system with all the file types and link layouts.
@@ -245,6 +246,33 @@ func TestCreateErrors(t *testing.T) {
 		}
 		if buf.Len() != 0 {
 			t.Errorf("%s: Create wrote %d bytes, want 0", tt.desc, buf.Len())
+		}
+	}
+}
+
+func TestCreateHardLinkFileInfoMismatch(t *testing.T) {
+	src := fstest.MapFS{
+		"etc/shadow":  {Mode: 0o644, Data: []byte("s"), Sys: &cpio.Header{Inode: 7, Links: 2}},
+		"etc/shadow-": {Mode: 0o644, Data: []byte("s"), Sys: &cpio.Header{Inode: 7, Links: 2}},
+	}
+	fileInfo := cpio.WithFileInfoMap(map[string]cpio.FileInfo{
+		"/etc/shadow": {Mode: 0o600},
+	})
+
+	var buf bytes.Buffer
+	if err := cpio.Create(&buf, src, fileInfo); err == nil {
+		t.Fatal("Create error = nil, want an error for links with different modes")
+	}
+}
+
+func TestCreateInvalidName(t *testing.T) {
+	src := fstest.MapFS{"f": {Mode: 0o644}, "d": {Mode: fs.ModeDir | 0o755}}
+	for _, tt := range []struct{ file, name string }{
+		{"f", "../evil"}, {"f", "a/../../evil"}, {"f", "d/evil"}, {"f", "a\x00b"}, {"f", ".."}, {"f", "."}, {"f", ""}, {"d", "."}, {"f", "f"},
+	} {
+		err := cpio.Create(io.Discard, testutil.RenamedFS{MapFS: src, File: tt.file, Name: tt.name})
+		if !errors.Is(err, fs.ErrInvalid) {
+			t.Errorf("%s as %q: Create error = %v, want %v", tt.file, tt.name, err, fs.ErrInvalid)
 		}
 	}
 }

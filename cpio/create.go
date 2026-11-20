@@ -89,16 +89,21 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 	var (
 		members []*member
 		dirs    = map[string]*member{}
-		groups  = map[linkKey][]*member{}
+		links   archivefs.HardLinks
+		groups  = map[string][]*member{} // the links of a file, by its first path
 		ino     int64
+		names   archivefs.Names
 	)
 
 	if err := fs.WalkDir(src, ".", func(name string, d fs.DirEntry, err error) error {
-		if err != nil || name == "." {
+		if err != nil {
 			return err
 		}
-		if !fs.ValidPath(name) || path.Base(name) != d.Name() {
-			return createError(name, fs.ErrInvalid)
+		if err := names.Check(name, d); err != nil {
+			return createError(name, err)
+		}
+		if name == "." {
+			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
@@ -153,26 +158,27 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 			}
 		}
 
-		key := linkKey{ino: int64(archivefs.GetIno(sys)), mode: mode & ModeType}
-		if !mode.IsDir() && key.ino != 0 && archivefs.GetNlink(sys) >= 2 {
-			if g := groups[key]; len(g) > 0 {
-				// Files on different devices can have the same inode number.
-				first := g[0]
-				if m.hdr.Mode != first.hdr.Mode || m.hdr.Size != first.hdr.Size || target != first.hdr.Linkname {
-					return createError(name, fmt.Errorf("cpio: inode of %s, but a different mode, size or target", first.name))
-				}
-				m.hdr.Inode = first.hdr.Inode
-				// Only the first link of a regular file carries the data. Each
-				// link of a symbolic link carries the target.
-				if mode.IsRegular() {
-					m.hdr.Size = 0
-				}
-			}
-			groups[key] = append(groups[key], m)
+		first, err := links.Add(src, name, fi)
+		if err != nil {
+			return createError(name, err)
 		}
-		if m.hdr.Inode == 0 {
+		if g := groups[first]; len(g) > 0 {
+			if m.hdr.Mode != g[0].hdr.Mode {
+				return createError(name, fmt.Errorf("cpio: hard link to %s, but a different mode", first))
+			}
+			m.hdr.Inode = g[0].hdr.Inode
+			// Only the first link of a regular file carries the data. Each
+			// link of a symbolic link carries the target.
+			if mode.IsRegular() {
+				m.hdr.Size = 0
+			}
+			groups[first] = append(g, m)
+		} else {
 			ino++
 			m.hdr.Inode = ino
+			if first != "" {
+				groups[first] = []*member{m}
+			}
 		}
 
 		members = append(members, m)

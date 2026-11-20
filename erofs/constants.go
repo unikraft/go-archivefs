@@ -58,6 +58,25 @@ const (
 	S_ISVTX  = 0o1000
 )
 
+func fileTypeFromStatMode(mode uint16) uint8 {
+	switch mode & S_IFMT {
+	case S_IFDIR:
+		return FT_DIR
+	case S_IFLNK:
+		return FT_SYMLINK
+	case S_IFBLK:
+		return FT_BLKDEV
+	case S_IFCHR:
+		return FT_CHRDEV
+	case S_IFIFO:
+		return FT_FIFO
+	case S_IFSOCK:
+		return FT_SOCK
+	default:
+		return FT_REG_FILE
+	}
+}
+
 func statModeFromFileMode(mode fs.FileMode) uint16 {
 	stMode := uint16(mode.Perm())
 
