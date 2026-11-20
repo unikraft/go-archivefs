@@ -265,14 +265,14 @@ func TestCreateHardLinkFileInfoMismatch(t *testing.T) {
 	}
 }
 
-func TestCreateRootListedAgain(t *testing.T) {
+func TestCreateInvalidName(t *testing.T) {
 	src := fstest.MapFS{"f": {Mode: 0o644}, "d": {Mode: fs.ModeDir | 0o755}}
-	for _, file := range []string{"f", "d"} {
-		for _, name := range []string{".", ""} {
-			err := cpio.Create(io.Discard, testutil.RenamedFS{MapFS: src, File: file, Name: name})
-			if !errors.Is(err, fs.ErrInvalid) {
-				t.Errorf("%s as %q: Create error = %v, want %v", file, name, err, fs.ErrInvalid)
-			}
+	for _, tt := range []struct{ file, name string }{
+		{"f", "../evil"}, {"f", "a/../../evil"}, {"f", "d/evil"}, {"f", "a\x00b"}, {"f", ".."}, {"f", "."}, {"f", ""}, {"d", "."}, {"f", "f"},
+	} {
+		err := cpio.Create(io.Discard, testutil.RenamedFS{MapFS: src, File: tt.file, Name: tt.name})
+		if !errors.Is(err, fs.ErrInvalid) {
+			t.Errorf("%s as %q: Create error = %v, want %v", tt.file, tt.name, err, fs.ErrInvalid)
 		}
 	}
 }

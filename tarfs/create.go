@@ -14,7 +14,6 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"path"
 
 	"github.com/unikraft/go-archivefs"
 )
@@ -45,17 +44,14 @@ func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 	tw := tar.NewWriter(dst)
 	var links archivefs.HardLinks
 
-	var seenRoot bool
+	var names archivefs.Names
 	err := fs.WalkDir(src, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-
-		// A child named "." or "" is also at ".", but comes after the root.
-		if name == "." && seenRoot || name != "." && (!fs.ValidPath(name) || path.Base(name) != d.Name()) {
-			return &fs.PathError{Op: "create", Path: name, Err: fs.ErrInvalid}
+		if err := names.Check(name, d); err != nil {
+			return &fs.PathError{Op: "create", Path: name, Err: err}
 		}
-		seenRoot = true
 
 		// A tar archive has an implicit root directory, and a root entry can confuse unarchivers.
 		if name == "." && !o.root {

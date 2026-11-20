@@ -552,14 +552,14 @@ func (w *writer) populateInodes() error {
 	w.xattrs = map[string][]byte{}
 	w.links = map[string]*linkGroup{}
 	var links archivefs.HardLinks
+	var names archivefs.Names
 
 	err := fs.WalkDir(w.src, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		// A source can list a path twice, such as "." as a child of the root.
-		if _, ok := w.inodes[path]; ok {
-			return &fs.PathError{Op: "create", Path: path, Err: fs.ErrInvalid}
+		if err := names.Check(path, d); err != nil {
+			return &fs.PathError{Op: "create", Path: path, Err: err}
 		}
 
 		fi, err := d.Info()
@@ -702,7 +702,7 @@ func (w *writer) dataForInode(path string, ino any) (io.ReadCloser, int64, error
 
 		for _, de := range entries {
 			childPath := stdpath.Join(path, de.Name())
-			if de.Name() == "." || strings.Contains(de.Name(), "\x00") || !fs.ValidPath(childPath) || stdpath.Base(childPath) != de.Name() {
+			if !archivefs.ValidName(de.Name()) {
 				return nil, 0, &fs.PathError{Op: "create", Path: childPath, Err: fs.ErrInvalid}
 			}
 			// The type comes from the inode, as ReadDir can give another type than the walk did.

@@ -92,20 +92,18 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 		links   archivefs.HardLinks
 		groups  = map[string][]*member{} // the links of a file, by its first path
 		ino     int64
-		root    bool
+		names   archivefs.Names
 	)
 
 	if err := fs.WalkDir(src, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		// A child named "." or "" is also at ".", but comes after the root.
-		if name == "." && !root {
-			root = true
-			return nil
+		if err := names.Check(name, d); err != nil {
+			return createError(name, err)
 		}
-		if name == "." || !fs.ValidPath(name) || path.Base(name) != d.Name() {
-			return createError(name, fs.ErrInvalid)
+		if name == "." {
+			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
