@@ -24,6 +24,7 @@ type CreateOption func(*createOptions)
 type createOptions struct {
 	allRoot  bool
 	fileInfo map[string]FileInfo
+	root     bool
 }
 
 // FileInfo is the owner and the permission bits that WithFileInfoMap sets on
@@ -43,15 +44,25 @@ func WithAllRoot(allRoot bool) CreateOption {
 }
 
 // WithFileInfoMap sets the owner and the permission bits of each path in m,
-// with keys such as "/etc/passwd". All links to a file must get the same mode.
+// with keys such as "/etc/passwd", or "/" for the root directory with
+// WithRootDir. All links to a file must get the same mode.
 func WithFileInfoMap(m map[string]FileInfo) CreateOption {
 	return func(o *createOptions) {
 		o.fileInfo = m
 	}
 }
 
-// Create writes the files of src to dst as an SVR4 archive, without the root
-// directory. CPIO cannot keep extended attributes, thus Create does not write them.
+// WithRootDir writes the root directory as the entry ".", with its owner, mode
+// and modification time.
+func WithRootDir(root bool) CreateOption {
+	return func(o *createOptions) {
+		o.root = root
+	}
+}
+
+// Create writes the files of src to dst as an SVR4 archive. It writes the root
+// directory only with WithRootDir. CPIO cannot keep extended attributes, thus
+// Create does not write them.
 func Create(dst io.Writer, src fs.FS, opts ...CreateOption) error {
 	var o createOptions
 	for _, opt := range opts {
@@ -102,7 +113,7 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 		if err := names.Check(name, d); err != nil {
 			return createError(name, err)
 		}
-		if name == "." {
+		if name == "." && !o.root {
 			return nil
 		}
 		fi, err := d.Info()
@@ -122,7 +133,7 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 
 		sys := fi.Sys()
 		uid, gid := archivefs.GetUID(sys), archivefs.GetGID(sys)
-		if info, ok := o.fileInfo["/"+name]; ok {
+		if info, ok := o.fileInfo[path.Join("/", name)]; ok {
 			uid, gid = info.Uid, info.Gid
 			mode = mode&^ModePerm | FileMode(info.Mode.Perm())
 		}
@@ -142,6 +153,9 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 				Links:    1,
 			},
 		}
+		if name == "." {
+			m.hdr.Name = "."
+		}
 		switch mode & ModeType {
 		case TypeRegular:
 			m.hdr.Size = fi.Size()
@@ -152,10 +166,10 @@ func collect(src fs.FS, o *createOptions) ([]*member, error) {
 			m.hdr.RdevMinor = int(archivefs.GetDevMinor(sys))
 		case TypeDir:
 			m.hdr.Links = 2
-			dirs[name] = m
 			if p, ok := dirs[path.Dir(name)]; ok {
 				p.hdr.Links++
 			}
+			dirs[name] = m
 		}
 
 		first, err := links.Add(src, name, fi)

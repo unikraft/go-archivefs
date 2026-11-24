@@ -132,10 +132,12 @@ func TestCreate(t *testing.T) {
 func TestCreateOptions(t *testing.T) {
 	owner := &cpio.Header{Uid: 1000, Guid: 1000}
 	src := fstest.MapFS{
+		".":          {Mode: fs.ModeDir | 0o700, Sys: owner},
 		"etc":        {Mode: fs.ModeDir | 0o755, Sys: owner},
 		"etc/shadow": {Mode: fs.ModeSetgid | 0o644, Data: []byte("x"), Sys: owner},
 	}
 	fileInfo := cpio.WithFileInfoMap(map[string]cpio.FileInfo{
+		"/":           {Uid: 7, Gid: 8, Mode: 0o750},
 		"/etc/shadow": {Uid: 0, Gid: 42, Mode: 0o640},
 	})
 
@@ -160,6 +162,24 @@ func TestCreateOptions(t *testing.T) {
 			desc: "all root and file info map",
 			opts: []cpio.CreateOption{cpio.WithAllRoot(true), fileInfo},
 			want: map[string]entry{
+				"./etc":        {cpio.TypeDir | 0o755, 0, 0},
+				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o640, 0, 0},
+			},
+		},
+		{
+			desc: "root dir and file info map",
+			opts: []cpio.CreateOption{cpio.WithRootDir(true), fileInfo},
+			want: map[string]entry{
+				".":            {cpio.TypeDir | 0o750, 7, 8},
+				"./etc":        {cpio.TypeDir | 0o755, 1000, 1000},
+				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o640, 0, 42},
+			},
+		},
+		{
+			desc: "root dir, all root and file info map",
+			opts: []cpio.CreateOption{cpio.WithRootDir(true), cpio.WithAllRoot(true), fileInfo},
+			want: map[string]entry{
+				".":            {cpio.TypeDir | 0o750, 0, 0},
 				"./etc":        {cpio.TypeDir | 0o755, 0, 0},
 				"./etc/shadow": {cpio.TypeRegular | cpio.ModeSetgid | 0o640, 0, 0},
 			},
@@ -193,6 +213,74 @@ func TestCreateOptions(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestCreateRootDir(t *testing.T) {
+	mtime := time.Unix(1700000000, 0)
+	src := fstest.MapFS{
+		".":         {Mode: fs.ModeDir | 0o700, ModTime: mtime, Sys: &cpio.Header{Uid: 1000, Guid: 1001}},
+		"bin":       {Mode: fs.ModeDir | 0o755},
+		"etc":       {Mode: fs.ModeDir | 0o755},
+		"etc/hosts": {Mode: 0o644, Data: []byte("hosts")},
+	}
+
+	// create returns the archive that Create writes from src, and its headers in order.
+	create := func(t *testing.T, opts ...cpio.CreateOption) ([]byte, []cpio.Header) {
+		t.Helper()
+
+		var buf bytes.Buffer
+		if err := cpio.Create(&buf, src, opts...); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		var hdrs []cpio.Header
+		r := cpio.NewReader(bytes.NewReader(buf.Bytes()))
+		for {
+			hdr, err := r.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Next: %v", err)
+			}
+			hdrs = append(hdrs, *hdr)
+		}
+		return buf.Bytes(), hdrs
+	}
+
+	t.Run("default", func(t *testing.T) {
+		_, hdrs := create(t)
+		for _, hdr := range hdrs {
+			if hdr.Name == "." {
+				t.Errorf("Create wrote the entry \".\" without WithRootDir")
+			}
+		}
+	})
+
+	t.Run("WithRootDir", func(t *testing.T) {
+		data, hdrs := create(t, cpio.WithRootDir(true))
+		if len(hdrs) == 0 || hdrs[0].Name != "." {
+			t.Fatalf("first entry is not \".\": %+v", hdrs)
+		}
+		root, mode := hdrs[0], cpio.FileMode(cpio.TypeDir|0o700)
+		if root.Mode != mode || root.Uid != 1000 || root.Guid != 1001 || root.Links != 4 || !root.ModTime.Equal(mtime) {
+			t.Errorf("entry \".\" = %v %d:%d, %d links, %v; want %v 1000:1001, 4 links, %v",
+				root.Mode, root.Uid, root.Guid, root.Links, root.ModTime, mode, mtime)
+		}
+
+		fsys, err := cpio.OpenFS(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("OpenFS: %v", err)
+		}
+		info, err := fsys.Stat(".")
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		hdr := info.Sys().(*cpio.Header)
+		if info.Mode() != fs.ModeDir|0o700 || hdr.Uid != 1000 || hdr.Guid != 1001 || !info.ModTime().Equal(mtime) {
+			t.Errorf("OpenFS root = %v %d:%d, %v; want %v 1000:1001, %v",
+				info.Mode(), hdr.Uid, hdr.Guid, info.ModTime(), fs.ModeDir|0o700, mtime)
+		}
+	})
 }
 
 func TestCreateErrors(t *testing.T) {
